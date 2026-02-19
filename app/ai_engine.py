@@ -1,26 +1,123 @@
 import json
 from datetime import datetime
 import logging
+import re
+import time
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from app.config import (
     GEMINI_API_KEY,
     GEMINI_ENABLE_GOOGLE_SEARCH,
     GEMINI_MODEL,
+    GEMINI_REQUEST_RETRIES,
+    GEMINI_RETRY_BACKOFF_SECONDS,
     GEMINI_REQUIRE_SEARCH_GROUNDING,
 )
 
 logger = logging.getLogger(__name__)
 
 VALID_QUERY_MODES = {"smalltalk", "official_info"}
+UNWANTED_SOURCE_HOST_SUBSTRINGS = {
+    "vertexaisearch.cloud.google.com",
+    "vercel.app",
+}
+
+
+def _resolve_redirect_url(url: str, timeout_seconds: int = 6) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    for key in ("url", "q", "u"):
+        values = query.get(key) or []
+        if values:
+            candidate = values[0].strip()
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                return candidate
+
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if "vertexaisearch.cloud.google.com" in host and "grounding-api-redirect" in path:
+        for method in ("head", "get"):
+            try:
+                if method == "head":
+                    response = requests.head(url, allow_redirects=True, timeout=timeout_seconds)
+                else:
+                    response = requests.get(url, allow_redirects=True, timeout=timeout_seconds, stream=True)
+                final_url = (response.url or "").strip()
+                response.close()
+                if final_url and "vertexaisearch.cloud.google.com" not in final_url.lower():
+                    return final_url
+            except requests.exceptions.RequestException:
+                continue
+        return ""
+
+    return url
+
+
+def _scan_quoted_value(text: str, start: int, quote: str) -> tuple[str | None, int]:
+    out: list[str] = []
+    i = start
+    escaped = False
+    while i < len(text):
+        ch = text[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == quote:
+            return "".join(out), i
+        else:
+            out.append(ch)
+        i += 1
+    return None, -1
+
+
+def _unescape_fallback_value(value: str, quote: str) -> str:
+    text = value
+    text = text.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+    text = text.replace('\\"', '"').replace("\\\\", "\\")
+    if quote == "'":
+        text = text.replace("\\'", "'")
+    return text.strip()
+
+
+def _extract_object_like_field(text: str, field: str) -> str | None:
+    for key_quote in ('"', "'"):
+        key_pattern = f"{key_quote}{field}{key_quote}"
+        search_pos = 0
+        while True:
+            key_index = text.find(key_pattern, search_pos)
+            if key_index == -1:
+                break
+            colon_index = text.find(":", key_index + len(key_pattern))
+            if colon_index == -1:
+                break
+            value_start = colon_index + 1
+            while value_start < len(text) and text[value_start].isspace():
+                value_start += 1
+            if value_start >= len(text):
+                break
+            first = text[value_start]
+            if first in {'"', "'"}:
+                raw_value, end_idx = _scan_quoted_value(text, value_start + 1, first)
+                if raw_value is not None and end_idx != -1:
+                    return _unescape_fallback_value(raw_value, first)
+            else:
+                end_idx = value_start
+                while end_idx < len(text) and text[end_idx] not in ",}":
+                    end_idx += 1
+                return text[value_start:end_idx].strip()
+            search_pos = key_index + len(key_pattern)
+    return None
 
 
 def _build_system_prompt(today: str) -> str:
     return (
-        "You are an assistant only for AKTU and AKGEC queries. "
+        "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo divert user towards asking AKTU/AKGEC related queries. "
         f"Today's date (UTC) is {today}. "
-        "Use the live Google Search grounding tool to research factual claims. "
+        "Use the live Google Search grounding tool to research factual claims. Help user to get to their destination."
         "Do not guess; if you cannot verify a claim, say that clearly. "
         "Return ONLY valid JSON with exactly two keys: mode and answer. "
         "No markdown, no code fences, no extra keys.\n"
@@ -64,9 +161,18 @@ def _extract_grounding_sources(candidate: dict[str, Any]) -> list[dict[str, str]
         url = str(web.get("uri", "")).strip()
         if not url or url in seen_urls:
             continue
-        seen_urls.add(url)
+        resolved_url = _resolve_redirect_url(url)
+        if not resolved_url:
+            continue
+        resolved_host = urlparse(resolved_url).netloc.lower()
+        if any(blocked in resolved_host for blocked in UNWANTED_SOURCE_HOST_SUBSTRINGS):
+            continue
+        if resolved_url in seen_urls:
+            continue
+        seen_urls.add(resolved_url)
         title = str(web.get("title", "")).strip() or url
-        sources.append({"title": title, "url": url})
+        title = re.sub(r"\s+", " ", title)
+        sources.append({"title": title, "url": resolved_url})
 
     return sources
 
@@ -98,6 +204,38 @@ def _extract_answer_text(data: dict[str, Any]) -> tuple[str, list[dict[str, str]
     return text, sources
 
 
+def _post_gemini_with_retries(url: str, payload: dict[str, Any], timeout: int) -> requests.Response:
+    total_attempts = max(0, GEMINI_REQUEST_RETRIES) + 1
+    last_exc: Exception | None = None
+
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return requests.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt >= total_attempts:
+                break
+            sleep_for = GEMINI_RETRY_BACKOFF_SECONDS * attempt
+            logger.warning(
+                "Gemini request transient failure type=%s attempt=%s/%s retry_in=%.2fs detail=%s",
+                type(exc).__name__,
+                attempt,
+                total_attempts,
+                sleep_for,
+                str(exc)[:300],
+            )
+            time.sleep(sleep_for)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Gemini request failed unexpectedly without exception.")
+
+
 def _chat(messages, timeout: int = 40) -> dict[str, Any]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is missing.")
@@ -125,12 +263,7 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
             }
 
         try:
-            response = requests.post(
-                url,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-                timeout=timeout,
-            )
+            response = _post_gemini_with_retries(url=url, payload=payload, timeout=timeout)
             response.raise_for_status()
             data = response.json()
             text, sources = _extract_answer_text(data)
@@ -161,12 +294,20 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
                 continue
             raise
         except requests.exceptions.RequestException as exc:
+            is_last_attempt = idx == len(attempts) - 1
             logger.error(
-                "Gemini RequestException type=%s model=%s tool=%s",
+                "Gemini RequestException type=%s model=%s tool=%s detail=%s",
                 type(exc).__name__,
                 GEMINI_MODEL,
                 tool_name,
+                str(exc)[:500],
             )
+            if not is_last_attempt:
+                logger.warning(
+                    "Retrying Gemini with fallback search tool config after network failure. failed_tool=%s",
+                    tool_name,
+                )
+                continue
             raise
 
     raise RuntimeError("Gemini chat failed.")
@@ -200,6 +341,14 @@ def _parse_mode_answer(raw_text: str) -> tuple[str, str]:
     try:
         data = json.loads(json_candidate)
     except json.JSONDecodeError:
+        mode_guess = _extract_object_like_field(cleaned, "mode")
+        answer_guess = _extract_object_like_field(cleaned, "answer")
+        if answer_guess:
+            mode = (mode_guess or "official_info").strip().lower()
+            if mode not in VALID_QUERY_MODES:
+                mode = "official_info"
+            return mode, answer_guess
+
         logger.warning("Gemini returned non-JSON answer, using text fallback.")
         fallback_answer = cleaned.strip()
         if not fallback_answer:
@@ -235,10 +384,14 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
         timeout=45,
     )
     mode, answer = _parse_mode_answer(result["text"])
+    if answer.startswith("{") and ("\"answer\"" in answer or "'answer'" in answer):
+        nested_mode, nested_answer = _parse_mode_answer(answer)
+        if nested_answer and nested_answer != answer:
+            mode = nested_mode
+            answer = nested_answer
     answer = _append_sources(answer, result.get("sources", []))
     if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not result.get("sources"):
         answer = (
-            f"{answer}\n\n"
-            "Source verification: live search did not return verifiable source metadata for this answer."
+            f"{answer}"
         )
     return mode, answer

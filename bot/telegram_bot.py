@@ -26,7 +26,7 @@ SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
     "calendar": "Calendar :- https://www.akgec.ac.in/academics/academic-calendar/",
     "admission": "Admission :- https://admissions.akgec.ac.in/",
-    "fee": "Fee Structure :- https://www.akgec.ac.in/admissions/fee-structure/",
+    "fee": "Fee Structure :-\nNew :- https://www.akgec.ac.in/fee-new-students/\nExisting :- https://www.akgec.ac.in/academic-fee/",
     "syllabus": "Syllabus :- https://aktu.ac.in/syllabus.html",
     "circulars": "AKTU Circulars :- https://aktu.ac.in/circulars.html",
 }
