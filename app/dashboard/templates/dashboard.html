@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AKGEC–AKTU Bot Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #ccc;
+            padding: 8px;
+        }
+        th {
+            background-color: #f4f4f4;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Query Logs (Last 100)</h2>
+
+<table>
+    <tr>
+        <th>Query</th>
+        <th>Intent</th>
+        <th>Status</th>
+        <th>Confidence</th>
+        <th>Time (UTC)</th>
+    </tr>
+
+    {% for row in rows %}
+    <tr>
+        <td>{{ row[0] }}</td>
+        <td>{{ row[1] }}</td>
+        <td>{{ row[2] }}</td>
+        <td>{{ row[3] }}</td>
+        <td>{{ row[4] }}</td>
+    </tr>
+    {% endfor %}
+
+</table>
+
+</body>
+</html>
