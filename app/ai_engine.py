@@ -46,17 +46,6 @@ def _tool_attempts() -> list[tuple[str, dict[str, Any] | None]]:
     return [
         ("google_search", {"google_search": {}}),
         ("googleSearch", {"googleSearch": {}}),
-        (
-            "google_search_retrieval",
-            {
-                "google_search_retrieval": {
-                    "dynamic_retrieval_config": {
-                        "mode": "MODE_DYNAMIC",
-                        "dynamic_threshold": 0.3,
-                    }
-                }
-            },
-        ),
     ]
 
 
@@ -121,7 +110,6 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
         ],
         "generationConfig": {
             "temperature": 0.1,
-            "responseMimeType": "application/json",
         },
     }
 
@@ -130,6 +118,11 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
         payload = dict(base_payload)
         if tool_cfg is not None:
             payload["tools"] = [tool_cfg]
+        else:
+            payload["generationConfig"] = {
+                **base_payload["generationConfig"],
+                "responseMimeType": "application/json",
+            }
 
         try:
             response = requests.post(
@@ -200,14 +193,18 @@ def _parse_mode_answer(raw_text: str) -> tuple[str, str]:
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
+    json_candidate = cleaned
     if start != -1 and end != -1 and end > start:
-        cleaned = cleaned[start : end + 1]
+        json_candidate = cleaned[start : end + 1]
 
     try:
-        data = json.loads(cleaned)
+        data = json.loads(json_candidate)
     except json.JSONDecodeError:
-        logger.error("Gemini returned invalid JSON for classify_and_reply: %s", raw_text[:500])
-        raise RuntimeError("Gemini returned invalid JSON.")
+        logger.warning("Gemini returned non-JSON answer, using text fallback.")
+        fallback_answer = cleaned.strip()
+        if not fallback_answer:
+            raise RuntimeError("Gemini returned invalid JSON and empty text answer.")
+        return "official_info", fallback_answer
 
     mode = str(data.get("mode", "official_info")).strip().lower()
     answer = str(data.get("answer", "")).strip()
