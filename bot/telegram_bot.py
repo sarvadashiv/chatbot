@@ -1,5 +1,4 @@
 import asyncio
-from contextlib import suppress
 import logging
 import os
 
@@ -95,13 +94,36 @@ def _get_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
+async def _safe_callback_answer(query) -> bool:
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        try:
+            await query.answer()
+            return True
+        except (TimedOut, NetworkError):
+            if attempt == TELEGRAM_SEND_RETRIES:
+                logging.exception("Failed to answer callback query after retries")
+                return False
+            await asyncio.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS * (attempt + 1))
+        except BadRequest:
+            return False
+    return False
+
+
 async def _typing_loop(context, chat_id: int):
-    try:
-        while True:
+    while True:
+        try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
-        return
+        except asyncio.CancelledError:
+            return
+        except (TimedOut, NetworkError):
+            logging.warning("Typing indicator request timed out for chat_id=%s", chat_id)
+        except BadRequest:
+            logging.warning("Typing indicator rejected for chat_id=%s", chat_id)
+            return
+        except Exception:
+            logging.exception("Typing indicator failed for chat_id=%s", chat_id)
+            return
+        await asyncio.sleep(4)
 
 
 async def _safe_reply(message, text: str, reply_markup=None) -> bool:
@@ -130,7 +152,7 @@ async def handle_start_fresh(update: Update, context):
     query = update.callback_query
     if not query:
         return
-    await query.answer()
+    await _safe_callback_answer(query)
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None:
         reset_backend_session(str(chat_id))
@@ -174,8 +196,12 @@ async def _run_query(message, context, chat_id: int, q: str):
             answer = "I got an invalid response from the server. Please try again."
         finally:
             typing_task.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await typing_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logging.exception("Typing task ended with unexpected error")
 
     await _safe_reply(message, answer, reply_markup=fresh_button(chat_id))
 
@@ -191,7 +217,7 @@ async def handle_shortcut(update: Update, context):
     if not query or not query.data or not update.effective_chat:
         return
 
-    await query.answer()
+    await _safe_callback_answer(query)
     if not query.data.startswith("shortcut:"):
         return
 
@@ -212,7 +238,7 @@ async def handle_toggle_shortcuts(update: Update, context):
     if not query or not query.data or not update.effective_chat:
         return
 
-    await query.answer()
+    await _safe_callback_answer(query)
     action = query.data.split(":", 1)[1].lower()
     _set_shortcut_menu(update.effective_chat.id, action == "show")
 
@@ -221,7 +247,7 @@ async def handle_toggle_shortcuts(update: Update, context):
 
     try:
         await query.message.edit_reply_markup(reply_markup=fresh_button(update.effective_chat.id))
-    except BadRequest:
+    except (BadRequest, TimedOut, NetworkError):
         return
 
 
@@ -240,6 +266,9 @@ async def handle_shortcut_command(update: Update, context):
 
 
 async def on_error(update: object, context):
+    if isinstance(context.error, (TimedOut, NetworkError)):
+        logging.warning("Telegram transient network error: %s", type(context.error).__name__)
+        return
     logging.exception("Telegram handler error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         await _safe_reply(
