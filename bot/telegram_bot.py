@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import os
+import sys
+from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -14,14 +17,33 @@ from telegram.ext import (
     filters,
 )
 
-API_URL = "http://backend:8000/query"
-RESET_URL = "http://backend:8000/reset_session"
+# Ensure project root is importable when launched as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app import ai_engine
+
+load_dotenv()
+
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000").rstrip("/")
+API_URL = f"{BACKEND_BASE_URL}/query"
+RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
+WEBHOOK_PUBLIC_BASE_URL = os.getenv("WEBHOOK_PUBLIC_BASE_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
+WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
 QUERY_TIMEOUT_SECONDS = 90
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
 _shortcut_menu_expanded: dict[int, bool] = {}
+_local_previous_user_text: dict[int, str] = {}
 SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
     "calendar": "Calendar :- https://www.akgec.ac.in/academics/academic-calendar/",
@@ -40,6 +62,18 @@ def _is_shortcut_menu_expanded(chat_id: int | None) -> bool:
 
 def _set_shortcut_menu(chat_id: int, expanded: bool) -> None:
     _shortcut_menu_expanded[chat_id] = expanded
+
+
+def _set_local_previous_user_text(chat_id: int, text: str) -> None:
+    _local_previous_user_text[chat_id] = text
+
+
+def _get_local_previous_user_text(chat_id: int) -> str:
+    return _local_previous_user_text.get(chat_id, "")
+
+
+def _reset_local_session(chat_id: int) -> None:
+    _local_previous_user_text.pop(chat_id, None)
 
 
 def fresh_button(chat_id: int | None = None):
@@ -144,6 +178,7 @@ async def start(update: Update, context):
     if chat_id is not None:
         reset_backend_session(str(chat_id))
         _set_shortcut_menu(chat_id, False)
+        _reset_local_session(chat_id)
     if update.message:
         await _safe_reply(update.message, get_start_text(), reply_markup=fresh_button(chat_id))
 
@@ -157,6 +192,7 @@ async def handle_start_fresh(update: Update, context):
     if chat_id is not None:
         reset_backend_session(str(chat_id))
         _set_shortcut_menu(chat_id, False)
+        _reset_local_session(chat_id)
     if query.message:
         await _safe_reply(query.message, get_start_text(), reply_markup=fresh_button(chat_id))
 
@@ -188,9 +224,20 @@ async def _run_query(message, context, chat_id: int, q: str):
             response.raise_for_status()
             data = response.json()
             answer = data.get("answer", "I could not process your request right now.")
+            _set_local_previous_user_text(chat_id, q)
         except requests.exceptions.RequestException:
-            logging.exception("Backend request failed")
-            answer = "Server is taking too long right now. Please try again in a few seconds."
+            logging.exception("Backend request failed, using local AI fallback")
+            try:
+                previous_user_text = _get_local_previous_user_text(chat_id)
+                _, answer = await asyncio.to_thread(
+                    ai_engine.classify_and_reply,
+                    q,
+                    previous_user_text,
+                )
+                _set_local_previous_user_text(chat_id, q)
+            except Exception:
+                logging.exception("Local AI fallback failed")
+                answer = "Server is taking too long right now. Please try again in a few seconds."
         except ValueError:
             logging.exception("Backend returned invalid JSON")
             answer = "I got an invalid response from the server. Please try again."
@@ -278,7 +325,7 @@ async def on_error(update: object, context):
         )
 
 
-def main():
+def _build_application():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("result", handle_shortcut_command))
@@ -292,6 +339,29 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_start_fresh, pattern="^start_fresh$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_error_handler(on_error)
+    return app
+
+
+def _webhook_url() -> str:
+    if not WEBHOOK_PUBLIC_BASE_URL:
+        raise RuntimeError("WEBHOOK_PUBLIC_BASE_URL is required when BOT_MODE=webhook.")
+    return f"{WEBHOOK_PUBLIC_BASE_URL}{WEBHOOK_PATH}"
+
+
+def main():
+    app = _build_application()
+    if BOT_MODE == "webhook":
+        app.run_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            webhook_url=_webhook_url(),
+            url_path=WEBHOOK_PATH.lstrip("/"),
+            secret_token=WEBHOOK_SECRET_TOKEN,
+            drop_pending_updates=False,
+        )
+        return
+    if BOT_MODE != "polling":
+        raise RuntimeError("BOT_MODE must be either 'polling' or 'webhook'.")
     app.run_polling()
 
 

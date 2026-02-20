@@ -14,7 +14,11 @@ services:
   bot:
     build: .
     command: python bot/telegram_bot.py
+    ports:
+      - "8443:8443"
     env_file: .env
+    environment:
+      - BACKEND_BASE_URL=http://backend:8000
     depends_on:
       - backend
     dns:
