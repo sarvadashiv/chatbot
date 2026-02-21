@@ -26,19 +26,20 @@ from app import ai_engine
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000").rstrip("/")
 API_URL = f"{BACKEND_BASE_URL}/query"
 RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
-WEBHOOK_PUBLIC_BASE_URL = os.getenv("WEBHOOK_PUBLIC_BASE_URL", "").strip().rstrip("/")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
-if not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = f"/{WEBHOOK_PATH}"
-WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0").strip() or "0.0.0.0"
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8443"))
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip() or None
-QUERY_TIMEOUT_SECONDS = 90
+USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
+QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "20"))
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -106,6 +107,8 @@ def fresh_button(chat_id: int | None = None):
 
 
 def reset_backend_session(chat_id: str):
+    if not USE_BACKEND_API:
+        return
     try:
         requests.post(RESET_URL, params={"chat_id": chat_id}, timeout=10)
     except requests.exceptions.RequestException:
@@ -213,34 +216,38 @@ async def _run_query(message, context, chat_id: int, q: str):
 
     async with lock:
         typing_task = asyncio.create_task(_typing_loop(context, chat_id))
+        answer: str | None = None
 
         try:
-            response = await asyncio.to_thread(
-                requests.get,
-                API_URL,
-                params=params,
-                timeout=QUERY_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            data = response.json()
-            answer = data.get("answer", "I could not process your request right now.")
-            _set_local_previous_user_text(chat_id, q)
-        except requests.exceptions.RequestException:
-            logging.exception("Backend request failed, using local AI fallback")
-            try:
-                previous_user_text = _get_local_previous_user_text(chat_id)
-                _, answer = await asyncio.to_thread(
-                    ai_engine.classify_and_reply,
-                    q,
-                    previous_user_text,
-                )
-                _set_local_previous_user_text(chat_id, q)
-            except Exception:
-                logging.exception("Local AI fallback failed")
-                answer = "Server is taking too long right now. Please try again in a few seconds."
-        except ValueError:
-            logging.exception("Backend returned invalid JSON")
-            answer = "I got an invalid response from the server. Please try again."
+            if USE_BACKEND_API:
+                try:
+                    response = await asyncio.to_thread(
+                        requests.get,
+                        API_URL,
+                        params=params,
+                        timeout=QUERY_TIMEOUT_SECONDS,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    answer = data.get("answer", "I could not process your request right now.")
+                    _set_local_previous_user_text(chat_id, q)
+                except requests.exceptions.RequestException:
+                    logging.exception("Backend request failed, using local AI fallback")
+                except ValueError:
+                    logging.exception("Backend returned invalid JSON, using local AI fallback")
+
+            if answer is None:
+                try:
+                    previous_user_text = _get_local_previous_user_text(chat_id)
+                    _, answer = await asyncio.to_thread(
+                        ai_engine.classify_and_reply,
+                        q,
+                        previous_user_text,
+                    )
+                    _set_local_previous_user_text(chat_id, q)
+                except Exception:
+                    logging.exception("Local AI fallback failed")
+                    answer = "Server is taking too long right now. Please try again in a few seconds."
         finally:
             typing_task.cancel()
             try:
@@ -342,26 +349,8 @@ def _build_application():
     return app
 
 
-def _webhook_url() -> str:
-    if not WEBHOOK_PUBLIC_BASE_URL:
-        raise RuntimeError("WEBHOOK_PUBLIC_BASE_URL is required when BOT_MODE=webhook.")
-    return f"{WEBHOOK_PUBLIC_BASE_URL}{WEBHOOK_PATH}"
-
-
 def main():
     app = _build_application()
-    if BOT_MODE == "webhook":
-        app.run_webhook(
-            listen=WEBHOOK_LISTEN,
-            port=WEBHOOK_PORT,
-            webhook_url=_webhook_url(),
-            url_path=WEBHOOK_PATH.lstrip("/"),
-            secret_token=WEBHOOK_SECRET_TOKEN,
-            drop_pending_updates=False,
-        )
-        return
-    if BOT_MODE != "polling":
-        raise RuntimeError("BOT_MODE must be either 'polling' or 'webhook'.")
     app.run_polling()
 
 
