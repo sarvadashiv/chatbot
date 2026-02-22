@@ -39,7 +39,8 @@ API_URL = f"{BACKEND_BASE_URL}/query"
 RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
-QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "20"))
+LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
+QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -232,9 +233,13 @@ async def _run_query(message, context, chat_id: int, q: str):
                     answer = data.get("answer", "I could not process your request right now.")
                     _set_local_previous_user_text(chat_id, q)
                 except requests.exceptions.RequestException:
-                    logging.exception("Backend request failed, using local AI fallback")
+                    logging.exception("Backend request failed")
+                    if not LOCAL_AI_FALLBACK:
+                        answer = "Backend is busy right now. Please try again in a few seconds."
                 except ValueError:
-                    logging.exception("Backend returned invalid JSON, using local AI fallback")
+                    logging.exception("Backend returned invalid JSON")
+                    if not LOCAL_AI_FALLBACK:
+                        answer = "Backend returned an invalid response. Please try again."
 
             if answer is None:
                 try:

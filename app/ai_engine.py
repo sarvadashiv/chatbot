@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 import logging
 import re
+import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -10,6 +11,7 @@ import requests
 from app.config import (
     GEMINI_API_KEY,
     GEMINI_ENABLE_GOOGLE_SEARCH,
+    GEMINI_FALLBACK_MODELS,
     GEMINI_MODEL,
     GEMINI_REQUEST_RETRIES,
     GEMINI_RETRY_BACKOFF_SECONDS,
@@ -23,6 +25,22 @@ UNWANTED_SOURCE_HOST_SUBSTRINGS = {
     "vertexaisearch.cloud.google.com",
     "vercel.app",
 }
+URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
+URL_VERIFY_TIMEOUT_SECONDS = 8
+LINK_RETRY_ATTEMPTS = 1
+URL_CHECK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+}
+MODEL_RETRY_AFTER_PATTERN = re.compile(r"please retry in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+MODEL_MIN_COOLDOWN_SECONDS = 30.0
+MODEL_LONG_COOLDOWN_SECONDS = 3600.0
+_MODEL_SKIP_UNTIL: dict[str, float] = {}
+_MODEL_PERMANENTLY_UNAVAILABLE: set[str] = set()
+_MODEL_STATE_LOCK = threading.Lock()
 
 
 def _resolve_redirect_url(url: str, timeout_seconds: int = 6) -> str:
@@ -53,6 +71,248 @@ def _resolve_redirect_url(url: str, timeout_seconds: int = 6) -> str:
         return ""
 
     return url
+
+
+def _normalize_extracted_url(url: str) -> str:
+    normalized = url.strip()
+    while normalized and normalized[-1] in ",.;:!?]}":
+        normalized = normalized[:-1]
+    while normalized.endswith(")") and normalized.count("(") < normalized.count(")"):
+        normalized = normalized[:-1]
+    return normalized.strip()
+
+
+def _is_blocked_source_host(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(blocked in host for blocked in UNWANTED_SOURCE_HOST_SUBSTRINGS)
+
+
+def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECONDS) -> str:
+    candidate = _resolve_redirect_url(url, timeout_seconds=timeout_seconds)
+    if not candidate:
+        return ""
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if _is_blocked_source_host(candidate):
+        return ""
+
+    for method in ("get", "head"):
+        try:
+            if method == "get":
+                response = requests.get(
+                    candidate,
+                    allow_redirects=True,
+                    timeout=timeout_seconds,
+                    stream=True,
+                    headers=URL_CHECK_HEADERS,
+                )
+            else:
+                response = requests.head(
+                    candidate,
+                    allow_redirects=True,
+                    timeout=timeout_seconds,
+                    headers=URL_CHECK_HEADERS,
+                )
+
+            status = response.status_code
+            final_url = _resolve_redirect_url((response.url or "").strip(), timeout_seconds=timeout_seconds)
+            response.close()
+            if not final_url:
+                continue
+            if _is_blocked_source_host(final_url):
+                continue
+            if status < 400 and method == "get":
+                return final_url
+            if status < 400 and method == "head":
+                try:
+                    confirm = requests.get(
+                        final_url,
+                        allow_redirects=True,
+                        timeout=timeout_seconds,
+                        stream=True,
+                        headers=URL_CHECK_HEADERS,
+                    )
+                    confirm_status = confirm.status_code
+                    confirm_final = _resolve_redirect_url(
+                        (confirm.url or "").strip(),
+                        timeout_seconds=timeout_seconds,
+                    )
+                    confirm.close()
+                    if (
+                        confirm_status < 400
+                        and confirm_final
+                        and not _is_blocked_source_host(confirm_final)
+                    ):
+                        return confirm_final
+                except requests.exceptions.RequestException:
+                    continue
+        except requests.exceptions.RequestException:
+            continue
+
+    return ""
+
+
+def _verify_working_url_cached(url: str, cache: dict[str, str]) -> str:
+    cached = cache.get(url)
+    if cached is not None:
+        return cached
+    verified = _verify_working_url(url)
+    cache[url] = verified
+    return verified
+
+
+def _extract_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in URL_PATTERN.finditer(text):
+        normalized = _normalize_extracted_url(match.group(0))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(normalized)
+    return urls
+
+
+def _pick_alternative_source_url(sources: list[dict[str, str]], failed_urls: list[str]) -> str:
+    if not sources:
+        return ""
+
+    failed_set = {_normalize_extracted_url(url) for url in failed_urls}
+    cache: dict[str, str] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_url = str(source.get("url", "")).strip()
+        if not source_url:
+            continue
+        verified = _verify_working_url_cached(source_url, cache)
+        if not verified:
+            continue
+        if _normalize_extracted_url(verified) in failed_set:
+            continue
+        return verified
+    return ""
+
+
+def _append_official_link(answer: str, url: str) -> str:
+    link_line = f"Official link: {url}"
+    if not answer:
+        return link_line
+    if url in answer:
+        return answer
+    return f"{answer}\n\n{link_line}".strip()
+
+
+def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
+    if not answer:
+        return answer, False, []
+
+    matches = list(URL_PATTERN.finditer(answer))
+    if not matches:
+        return answer, False, []
+
+    cache: dict[str, str] = {}
+    out_parts: list[str] = []
+    removed_unverified = False
+    failed_urls: list[str] = []
+    seen_failed_urls: set[str] = set()
+    cursor = 0
+
+    for match in matches:
+        raw = match.group(0)
+        normalized = _normalize_extracted_url(raw)
+        if not normalized:
+            continue
+
+        out_parts.append(answer[cursor:match.start()])
+        verified = _verify_working_url_cached(normalized, cache)
+        trailing = raw[len(normalized):] if raw.startswith(normalized) else ""
+
+        if verified:
+            out_parts.append(f"{verified}{trailing}")
+        else:
+            removed_unverified = True
+            if normalized not in seen_failed_urls:
+                seen_failed_urls.add(normalized)
+                failed_urls.append(normalized)
+            out_parts.append(trailing)
+
+        cursor = match.end()
+
+    out_parts.append(answer[cursor:])
+    sanitized = "".join(out_parts)
+    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+    sanitized = re.sub(r"\(\s*\)", "", sanitized)
+    sanitized = re.sub(r"\s+([,.;:!?])", r"\1", sanitized)
+    sanitized = re.sub(r" +\n", "\n", sanitized)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+    return sanitized, removed_unverified, failed_urls
+
+
+def _build_retry_user_content(user_text: str, previous_user_text: str, failed_urls: list[str]) -> str:
+    lines = [
+        "Previous answer had links that failed live verification (HTTP 4xx/5xx, including 403).",
+    ]
+    if failed_urls:
+        lines.append(f"Failed URLs: {', '.join(failed_urls)}")
+
+    if previous_user_text:
+        lines.append(f"Previous user message: {previous_user_text}")
+    lines.append(f"Current user message: {user_text}")
+    lines.append(
+        "Search again and provide an alternative official direct endpoint URL that is currently reachable."
+    )
+    lines.append(
+        "If no verified official URL can be found right now, say that clearly."
+    )
+    return "\n".join(lines)
+
+
+def _retry_for_alternative_link(
+    user_text: str,
+    previous_user_text: str,
+    failed_urls: list[str],
+) -> tuple[str, str, list[dict[str, str]], bool]:
+    mode = "official_info"
+    answer = ""
+    sources: list[dict[str, str]] = []
+    removed_unverified_links = False
+
+    for _ in range(LINK_RETRY_ATTEMPTS):
+        retry_result = _chat(
+            [
+                {
+                    "role": "system",
+                    "content": _build_system_prompt(datetime.utcnow().strftime("%B %d, %Y")),
+                },
+                {
+                    "role": "user",
+                    "content": _build_retry_user_content(
+                        user_text=user_text,
+                        previous_user_text=previous_user_text,
+                        failed_urls=failed_urls,
+                    ),
+                },
+            ],
+            timeout=45,
+        )
+
+        mode, answer = _parse_mode_answer(retry_result["text"])
+        if answer.startswith("{") and ("\"answer\"" in answer or "'answer'" in answer):
+            nested_mode, nested_answer = _parse_mode_answer(answer)
+            if nested_answer and nested_answer != answer:
+                mode = nested_mode
+                answer = nested_answer
+
+        answer, removed_unverified_links, retry_failed_urls = _sanitize_answer_links(answer)
+        sources = retry_result.get("sources", [])
+        failed_urls = retry_failed_urls
+        if _extract_urls(answer) or sources:
+            break
+
+    return mode, answer, sources, removed_unverified_links
 
 
 def _scan_quoted_value(text: str, start: int, quote: str) -> tuple[str | None, int]:
@@ -117,8 +377,8 @@ def _build_system_prompt(today: str) -> str:
     return (
         "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo divert user towards asking AKTU/AKGEC related queries. "
         f"Today's date (UTC) is {today}. "
-        "Use the live Google Search grounding tool to research factual claims. Provide urls for user to get to their destination. Do not instruct them how to reach to link, provide them directly."
-        "Do not refuse to share any AKTU/AKGEC links."
+        "Use the live Google Search grounding tool to research factual claims. Provide endpoint urls for user to get to their destination directly. DO NOT instruct them how to reach to link, provide them direct link."
+        "Do not refuse to share any AKTU/AKGEC links. MUST VERIFY that the link is correct and working(no errors like 403) before giving a response."
         "Do not guess; if you cannot verify a claim, say that clearly. "
         "Return ONLY valid JSON with exactly two keys: mode and answer. "
         "No markdown, no code fences, no extra keys.\n"
@@ -147,11 +407,67 @@ def _tool_attempts() -> list[tuple[str, dict[str, Any] | None]]:
     ]
 
 
+def _extract_retry_after_seconds(error_text: str) -> float:
+    match = MODEL_RETRY_AFTER_PATTERN.search(error_text or "")
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mark_model_unavailable(model_name: str, status: int | str, error_text: str) -> None:
+    now = time.time()
+    with _MODEL_STATE_LOCK:
+        if status == 404:
+            _MODEL_PERMANENTLY_UNAVAILABLE.add(model_name)
+            return
+
+        if status not in {403, 429}:
+            return
+
+        retry_after = _extract_retry_after_seconds(error_text)
+        floor = MODEL_MIN_COOLDOWN_SECONDS
+        if "limit: 0" in (error_text or "").lower():
+            floor = MODEL_LONG_COOLDOWN_SECONDS
+        cooldown = max(retry_after, floor)
+        until = now + cooldown
+        existing = _MODEL_SKIP_UNTIL.get(model_name, 0.0)
+        if until > existing:
+            _MODEL_SKIP_UNTIL[model_name] = until
+
+
+def _model_skip_reason(model_name: str) -> str:
+    now = time.time()
+    with _MODEL_STATE_LOCK:
+        if model_name in _MODEL_PERMANENTLY_UNAVAILABLE:
+            return "permanent_unavailable"
+        skip_until = _MODEL_SKIP_UNTIL.get(model_name, 0.0)
+        if skip_until > now:
+            return f"cooldown_{skip_until - now:.1f}s"
+    return ""
+
+
+def _model_attempts() -> list[str]:
+    models = [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        name = str(model).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    return deduped
+
+
 def _extract_grounding_sources(candidate: dict[str, Any]) -> list[dict[str, str]]:
     metadata = candidate.get("groundingMetadata") or {}
     chunks = metadata.get("groundingChunks") or []
     sources: list[dict[str, str]] = []
     seen_urls: set[str] = set()
+    validation_cache: dict[str, str] = {}
 
     for chunk in chunks:
         if not isinstance(chunk, dict):
@@ -162,11 +478,8 @@ def _extract_grounding_sources(candidate: dict[str, Any]) -> list[dict[str, str]
         url = str(web.get("uri", "")).strip()
         if not url or url in seen_urls:
             continue
-        resolved_url = _resolve_redirect_url(url)
+        resolved_url = _verify_working_url_cached(url, validation_cache)
         if not resolved_url:
-            continue
-        resolved_host = urlparse(resolved_url).netloc.lower()
-        if any(blocked in resolved_host for blocked in UNWANTED_SOURCE_HOST_SUBSTRINGS):
             continue
         if resolved_url in seen_urls:
             continue
@@ -242,7 +555,6 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
         raise RuntimeError("GEMINI_API_KEY is missing.")
 
     prompt = _messages_to_prompt(messages)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     base_payload = {
         "contents": [
             {"parts": [{"text": prompt}]}
@@ -252,64 +564,107 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
         },
     }
 
-    attempts = _tool_attempts()
-    for idx, (tool_name, tool_cfg) in enumerate(attempts):
-        payload = dict(base_payload)
-        if tool_cfg is not None:
-            payload["tools"] = [tool_cfg]
-        else:
-            payload["generationConfig"] = {
-                **base_payload["generationConfig"],
-                "responseMimeType": "application/json",
-            }
+    model_attempts = _model_attempts()
+    tool_attempts = _tool_attempts()
+    attempted_any_model = False
+    for model_idx, model_name in enumerate(model_attempts):
+        skip_reason = _model_skip_reason(model_name)
+        if skip_reason:
+            logger.warning("Skipping Gemini model=%s reason=%s", model_name, skip_reason)
+            continue
 
-        try:
-            response = _post_gemini_with_retries(url=url, payload=payload, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
-            text, sources = _extract_answer_text(data)
-            if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
-                logger.warning("Gemini returned answer without grounding metadata.")
-            return {
-                "text": text,
-                "sources": sources,
-                "tool": tool_name,
-            }
-        except requests.exceptions.HTTPError as exc:
-            http_response = exc.response
-            status = http_response.status_code if http_response is not None else "N/A"
-            body = ((http_response.text if http_response is not None else "") or "")[:1200]
-            logger.error(
-                "Gemini HTTPError status=%s model=%s tool=%s body=%s",
-                status,
-                GEMINI_MODEL,
-                tool_name,
-                body,
-            )
-            is_last_attempt = idx == len(attempts) - 1
-            if tool_cfg is not None and status == 400 and not is_last_attempt:
-                logger.warning(
-                    "Retrying Gemini with fallback search tool config. failed_tool=%s",
+        attempted_any_model = True
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        model_exhausted = False
+        for tool_idx, (tool_name, tool_cfg) in enumerate(tool_attempts):
+            payload = dict(base_payload)
+            if tool_cfg is not None:
+                payload["tools"] = [tool_cfg]
+            else:
+                payload["generationConfig"] = {
+                    **base_payload["generationConfig"],
+                    "responseMimeType": "application/json",
+                }
+
+            try:
+                response = _post_gemini_with_retries(url=url, payload=payload, timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                text, sources = _extract_answer_text(data)
+                if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
+                    logger.warning("Gemini returned answer without grounding metadata.")
+                return {
+                    "text": text,
+                    "sources": sources,
+                    "tool": tool_name,
+                    "model": model_name,
+                }
+            except requests.exceptions.HTTPError as exc:
+                http_response = exc.response
+                status = http_response.status_code if http_response is not None else "N/A"
+                body = ((http_response.text if http_response is not None else "") or "")[:1200]
+                logger.error(
+                    "Gemini HTTPError status=%s model=%s tool=%s body=%s",
+                    status,
+                    model_name,
                     tool_name,
+                    body,
                 )
-                continue
-            raise
-        except requests.exceptions.RequestException as exc:
-            is_last_attempt = idx == len(attempts) - 1
-            logger.error(
-                "Gemini RequestException type=%s model=%s tool=%s detail=%s",
-                type(exc).__name__,
-                GEMINI_MODEL,
-                tool_name,
-                str(exc)[:500],
-            )
-            if not is_last_attempt:
-                logger.warning(
-                    "Retrying Gemini with fallback search tool config after network failure. failed_tool=%s",
+                _mark_model_unavailable(model_name, status, body)
+                is_last_tool_attempt = tool_idx == len(tool_attempts) - 1
+                is_last_model_attempt = model_idx == len(model_attempts) - 1
+
+                if tool_cfg is not None and status == 400 and not is_last_tool_attempt:
+                    logger.warning(
+                        "Retrying Gemini with fallback search tool config. failed_tool=%s",
+                        tool_name,
+                    )
+                    continue
+
+                if status in {429, 403, 404} and not is_last_model_attempt:
+                    next_model = model_attempts[model_idx + 1]
+                    logger.warning(
+                        "Gemini model failover status=%s model=%s fallback_model=%s",
+                        status,
+                        model_name,
+                        next_model,
+                    )
+                    model_exhausted = True
+                    break
+
+                if status == 400 and not is_last_model_attempt:
+                    next_model = model_attempts[model_idx + 1]
+                    logger.warning(
+                        "Gemini model returned 400 after tool attempts. Trying fallback model=%s current_model=%s",
+                        next_model,
+                        model_name,
+                    )
+                    model_exhausted = True
+                    break
+
+                raise
+            except requests.exceptions.RequestException as exc:
+                is_last_tool_attempt = tool_idx == len(tool_attempts) - 1
+                logger.error(
+                    "Gemini RequestException type=%s model=%s tool=%s detail=%s",
+                    type(exc).__name__,
+                    model_name,
                     tool_name,
+                    str(exc)[:500],
                 )
-                continue
-            raise
+                if not is_last_tool_attempt:
+                    logger.warning(
+                        "Retrying Gemini with fallback search tool config after network failure. failed_tool=%s",
+                        tool_name,
+                    )
+                    continue
+                raise
+
+        if model_exhausted:
+            continue
+
+    if not attempted_any_model:
+        raise RuntimeError("All configured Gemini models are currently unavailable.")
 
     raise RuntimeError("Gemini chat failed.")
 
@@ -390,8 +745,48 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
         if nested_answer and nested_answer != answer:
             mode = nested_mode
             answer = nested_answer
-    answer = _append_sources(answer, result.get("sources", []))
-    if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not result.get("sources"):
+    answer, removed_unverified_links, failed_urls = _sanitize_answer_links(answer)
+    sources = result.get("sources", [])
+    if removed_unverified_links and not _extract_urls(answer):
+        alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
+        if alternative_source_url:
+            answer = _append_official_link(answer, alternative_source_url)
+            removed_unverified_links = False
+
+    if removed_unverified_links and not _extract_urls(answer):
+        try:
+            (
+                retry_mode,
+                retry_answer,
+                retry_sources,
+                retry_removed_unverified,
+            ) = _retry_for_alternative_link(
+                user_text=user_text,
+                previous_user_text=previous_user_text,
+                failed_urls=failed_urls,
+            )
+            if retry_answer:
+                mode = retry_mode
+                answer = retry_answer
+                sources = retry_sources
+                removed_unverified_links = retry_removed_unverified
+                if removed_unverified_links and not _extract_urls(answer):
+                    alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
+                    if alternative_source_url:
+                        answer = _append_official_link(answer, alternative_source_url)
+                        removed_unverified_links = False
+        except Exception as exc:
+            logger.warning(
+                "Alternative link retry failed type=%s detail=%s",
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+
+    answer = _append_sources(answer, sources)
+    if removed_unverified_links and not _extract_urls(answer):
+        note = "I could not verify a working official link right now."
+        answer = f"{answer}\n\n{note}".strip()
+    if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
         answer = (
             f"{answer}"
         )

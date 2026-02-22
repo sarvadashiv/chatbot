@@ -45,11 +45,31 @@ def query(q: str, chat_id: str | None = None):
     try:
         mode, reply = ai_engine.classify_and_reply(q, previous_user_text=previous_user_text)
         status = "AI_ONE_CALL"
-    except (requests.exceptions.RequestException, RuntimeError) as exc:
+    except requests.exceptions.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else None
+        logger.error("classify_and_reply failed type=%s status=%s", type(exc).__name__, status_code)
+        mode = "official_info"
+        if status_code == 429:
+            reply = "AI quota is currently exhausted. Please try again shortly."
+            status = "LLM_QUOTA_EXCEEDED"
+        else:
+            reply = "AI service is unavailable right now. Please try again."
+            status = "LLM_HTTP_ERROR"
+    except requests.exceptions.RequestException as exc:
         logger.error("classify_and_reply failed type=%s", type(exc).__name__)
         mode = "official_info"
         reply = "AI service is taking too long right now. Please try again."
         status = "LLM_TIMEOUT"
+    except RuntimeError as exc:
+        logger.error("classify_and_reply failed type=%s", type(exc).__name__)
+        mode = "official_info"
+        if "currently unavailable" in str(exc).lower():
+            reply = "All configured AI models are temporarily unavailable. Please try again later."
+            status = "LLM_MODELS_UNAVAILABLE"
+        else:
+            reply = "AI service is taking too long right now. Please try again."
+            status = "LLM_TIMEOUT"
 
     log_query(
         query=q,
