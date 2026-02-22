@@ -6,7 +6,13 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
@@ -41,6 +47,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
 LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
 QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
+SHOW_INLINE_SHORTCUTS = _env_bool("SHOW_INLINE_SHORTCUTS", False)
+SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", True)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -50,10 +58,26 @@ SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
     "calendar": "Calendar :- https://www.akgec.ac.in/academics/academic-calendar/",
     "admission": "Admission :- https://admissions.akgec.ac.in/",
-    "fee": "Fee Structure :-\nNew :- https://www.akgec.ac.in/fee-new-students/\nExisting :- https://www.akgec.ac.in/academic-fee/",
+    "fee": "Structure :-\nNew Students:- https://www.akgec.ac.in/fee-new-students/\nExisting :- https://www.akgec.ac.in/academic-fee/",
     "syllabus": "Syllabus :- https://aktu.ac.in/syllabus.html",
     "circulars": "AKTU Circulars :- https://aktu.ac.in/circulars.html",
 }
+BOT_COMMANDS = [
+    BotCommand("start", "Start bot"),
+    BotCommand("fresh", "Start fresh session"),
+    BotCommand("result", "Get result link"),
+    BotCommand("calendar", "Get academic calendar"),
+    BotCommand("admission", "Get admission link"),
+    BotCommand("fee", "Get fee links"),
+    BotCommand("syllabus", "Get syllabus link"),
+    BotCommand("circulars", "Get circulars link"),
+]
+REPLY_SHORTCUT_ROWS = [
+    ["/result", "/calendar"],
+    ["/admission", "/fee"],
+    ["/syllabus", "/circulars"],
+    ["/fresh"],
+]
 
 
 def _is_shortcut_menu_expanded(chat_id: int | None) -> bool:
@@ -76,6 +100,23 @@ def _get_local_previous_user_text(chat_id: int) -> str:
 
 def _reset_local_session(chat_id: int) -> None:
     _local_previous_user_text.pop(chat_id, None)
+
+
+def _reply_shortcut_keyboard():
+    return ReplyKeyboardMarkup(
+        REPLY_SHORTCUT_ROWS,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Ask about AKTU/AKGEC or use shortcuts...",
+    )
+
+
+def _active_reply_markup(chat_id: int | None = None):
+    if SHOW_REPLY_SHORTCUT_KEYBOARD:
+        return _reply_shortcut_keyboard()
+    if not SHOW_INLINE_SHORTCUTS:
+        return None
+    return fresh_button(chat_id)
 
 
 def fresh_button(chat_id: int | None = None):
@@ -119,8 +160,8 @@ def reset_backend_session(chat_id: str):
 def get_start_text():
     return (
         "Hello!\n"
-        "Ask me anything about AKTU and AKGEC official information.\n"
-        "You can also use the shortcut buttons below."
+        "Here for any AKTU and AKGEC updates?.\n"
+        "You can also use the shortcut menu below or just type '/''."
     )
 
 
@@ -184,7 +225,17 @@ async def start(update: Update, context):
         _set_shortcut_menu(chat_id, False)
         _reset_local_session(chat_id)
     if update.message:
-        await _safe_reply(update.message, get_start_text(), reply_markup=fresh_button(chat_id))
+        await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
+
+
+async def handle_fresh_command(update: Update, context):
+    if not update.message or not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
+    reset_backend_session(str(chat_id))
+    _set_shortcut_menu(chat_id, False)
+    _reset_local_session(chat_id)
+    await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
 
 
 async def handle_start_fresh(update: Update, context):
@@ -198,7 +249,7 @@ async def handle_start_fresh(update: Update, context):
         _set_shortcut_menu(chat_id, False)
         _reset_local_session(chat_id)
     if query.message:
-        await _safe_reply(query.message, get_start_text(), reply_markup=fresh_button(chat_id))
+        await _safe_reply(query.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
 
 
 async def _run_query(message, context, chat_id: int, q: str):
@@ -262,7 +313,7 @@ async def _run_query(message, context, chat_id: int, q: str):
             except Exception:
                 logging.exception("Typing task ended with unexpected error")
 
-    await _safe_reply(message, answer, reply_markup=fresh_button(chat_id))
+    await _safe_reply(message, answer, reply_markup=_active_reply_markup(chat_id))
 
 
 async def handle(update: Update, context):
@@ -288,7 +339,7 @@ async def handle_shortcut(update: Update, context):
     await _safe_reply(
         query.message,
         shortcut_link,
-        reply_markup=fresh_button(update.effective_chat.id),
+        reply_markup=_active_reply_markup(update.effective_chat.id),
     )
 
 
@@ -320,7 +371,7 @@ async def handle_shortcut_command(update: Update, context):
     await _safe_reply(
         update.message,
         shortcut_link,
-        reply_markup=fresh_button(update.effective_chat.id),
+        reply_markup=_active_reply_markup(update.effective_chat.id),
     )
 
 
@@ -333,13 +384,18 @@ async def on_error(update: object, context):
         await _safe_reply(
             update.effective_message,
             "Something went wrong. Please try again.",
-            reply_markup=fresh_button(update.effective_chat.id if update.effective_chat else None),
+            reply_markup=_active_reply_markup(update.effective_chat.id if update.effective_chat else None),
         )
 
 
+async def _post_init(application):
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+
 def _build_application():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("fresh", handle_fresh_command))
     app.add_handler(CommandHandler("result", handle_shortcut_command))
     app.add_handler(CommandHandler("calendar", handle_shortcut_command))
     app.add_handler(CommandHandler("admission", handle_shortcut_command))

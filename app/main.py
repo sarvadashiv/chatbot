@@ -1,7 +1,7 @@
 import json
-import logging
+import logging #backend logs
 
-import requests
+import requests #catch req related exceptions
 from fastapi import FastAPI
 
 from app import ai_engine
