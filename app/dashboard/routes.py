@@ -14,7 +14,7 @@ def dashboard(request: Request):
     c = conn.cursor()
 
     c.execute("""
-        SELECT query, intent, status, confidence, created_at
+        SELECT query, intent, status, created_at
         FROM query_logs
         ORDER BY created_at DESC
         LIMIT 100

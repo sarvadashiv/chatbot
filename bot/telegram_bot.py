@@ -8,16 +8,13 @@ import requests
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -47,12 +44,10 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
 LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
 QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
-SHOW_INLINE_SHORTCUTS = _env_bool("SHOW_INLINE_SHORTCUTS", False)
 SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", True)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
-_shortcut_menu_expanded: dict[int, bool] = {}
 _local_previous_user_text: dict[int, str] = {}
 SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
@@ -80,16 +75,6 @@ REPLY_SHORTCUT_ROWS = [
 ]
 
 
-def _is_shortcut_menu_expanded(chat_id: int | None) -> bool:
-    if chat_id is None:
-        return False
-    return _shortcut_menu_expanded.get(chat_id, False)
-
-
-def _set_shortcut_menu(chat_id: int, expanded: bool) -> None:
-    _shortcut_menu_expanded[chat_id] = expanded
-
-
 def _set_local_previous_user_text(chat_id: int, text: str) -> None:
     _local_previous_user_text[chat_id] = text
 
@@ -114,38 +99,7 @@ def _reply_shortcut_keyboard():
 def _active_reply_markup(chat_id: int | None = None):
     if SHOW_REPLY_SHORTCUT_KEYBOARD:
         return _reply_shortcut_keyboard()
-    if not SHOW_INLINE_SHORTCUTS:
-        return None
-    return fresh_button(chat_id)
-
-
-def fresh_button(chat_id: int | None = None):
-    if not _is_shortcut_menu_expanded(chat_id):
-        return InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("More...", callback_data="toggle_shortcuts:show")],
-                [InlineKeyboardButton("Start Fresh", callback_data="start_fresh")],
-            ]
-        )
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Result", callback_data="shortcut:result"),
-                InlineKeyboardButton("Calendar", callback_data="shortcut:calendar"),
-            ],
-            [
-                InlineKeyboardButton("Admission", callback_data="shortcut:admission"),
-                InlineKeyboardButton("Fee", callback_data="shortcut:fee"),
-            ],
-            [
-                InlineKeyboardButton("Syllabus", callback_data="shortcut:syllabus"),
-                InlineKeyboardButton("Circulars", callback_data="shortcut:circulars"),
-            ],
-            [InlineKeyboardButton("Hide...", callback_data="toggle_shortcuts:hide")],
-            [InlineKeyboardButton("Start Fresh", callback_data="start_fresh")],
-        ]
-    )
+    return None
 
 
 def reset_backend_session(chat_id: str):
@@ -160,8 +114,8 @@ def reset_backend_session(chat_id: str):
 def get_start_text():
     return (
         "Hello!\n"
-        "Here for any AKTU and AKGEC updates?.\n"
-        "You can also use the shortcut menu below or just type '/''."
+        "Here for any AKTU and AKGEC updates.\n"
+        "You can also use the shortcut keyboard or type '/'."
     )
 
 
@@ -173,21 +127,6 @@ def _get_lock(chat_id: int) -> asyncio.Lock:
     return lock
 
 
-async def _safe_callback_answer(query) -> bool:
-    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
-        try:
-            await query.answer()
-            return True
-        except (TimedOut, NetworkError):
-            if attempt == TELEGRAM_SEND_RETRIES:
-                logging.exception("Failed to answer callback query after retries")
-                return False
-            await asyncio.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS * (attempt + 1))
-        except BadRequest:
-            return False
-    return False
-
-
 async def _typing_loop(context, chat_id: int):
     while True:
         try:
@@ -196,9 +135,6 @@ async def _typing_loop(context, chat_id: int):
             return
         except (TimedOut, NetworkError):
             logging.warning("Typing indicator request timed out for chat_id=%s", chat_id)
-        except BadRequest:
-            logging.warning("Typing indicator rejected for chat_id=%s", chat_id)
-            return
         except Exception:
             logging.exception("Typing indicator failed for chat_id=%s", chat_id)
             return
@@ -222,7 +158,6 @@ async def start(update: Update, context):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None:
         reset_backend_session(str(chat_id))
-        _set_shortcut_menu(chat_id, False)
         _reset_local_session(chat_id)
     if update.message:
         await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
@@ -233,23 +168,8 @@ async def handle_fresh_command(update: Update, context):
         return
     chat_id = update.effective_chat.id
     reset_backend_session(str(chat_id))
-    _set_shortcut_menu(chat_id, False)
     _reset_local_session(chat_id)
     await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
-
-
-async def handle_start_fresh(update: Update, context):
-    query = update.callback_query
-    if not query:
-        return
-    await _safe_callback_answer(query)
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is not None:
-        reset_backend_session(str(chat_id))
-        _set_shortcut_menu(chat_id, False)
-        _reset_local_session(chat_id)
-    if query.message:
-        await _safe_reply(query.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
 
 
 async def _run_query(message, context, chat_id: int, q: str):
@@ -322,45 +242,6 @@ async def handle(update: Update, context):
     await _run_query(update.message, context, update.effective_chat.id, update.message.text)
 
 
-async def handle_shortcut(update: Update, context):
-    query = update.callback_query
-    if not query or not query.data or not update.effective_chat:
-        return
-
-    await _safe_callback_answer(query)
-    if not query.data.startswith("shortcut:"):
-        return
-
-    key = query.data.split(":", 1)[1].lower()
-    shortcut_link = SHORTCUT_QUERIES.get(key)
-    if not shortcut_link:
-        return
-
-    await _safe_reply(
-        query.message,
-        shortcut_link,
-        reply_markup=_active_reply_markup(update.effective_chat.id),
-    )
-
-
-async def handle_toggle_shortcuts(update: Update, context):
-    query = update.callback_query
-    if not query or not query.data or not update.effective_chat:
-        return
-
-    await _safe_callback_answer(query)
-    action = query.data.split(":", 1)[1].lower()
-    _set_shortcut_menu(update.effective_chat.id, action == "show")
-
-    if not query.message:
-        return
-
-    try:
-        await query.message.edit_reply_markup(reply_markup=fresh_button(update.effective_chat.id))
-    except (BadRequest, TimedOut, NetworkError):
-        return
-
-
 async def handle_shortcut_command(update: Update, context):
     if not update.message or not update.message.text or not update.effective_chat:
         return
@@ -402,9 +283,6 @@ def _build_application():
     app.add_handler(CommandHandler("fee", handle_shortcut_command))
     app.add_handler(CommandHandler("syllabus", handle_shortcut_command))
     app.add_handler(CommandHandler("circulars", handle_shortcut_command))
-    app.add_handler(CallbackQueryHandler(handle_toggle_shortcuts, pattern="^toggle_shortcuts:"))
-    app.add_handler(CallbackQueryHandler(handle_shortcut, pattern="^shortcut:"))
-    app.add_handler(CallbackQueryHandler(handle_start_fresh, pattern="^start_fresh$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     app.add_error_handler(on_error)
     return app

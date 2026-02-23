@@ -75,7 +75,6 @@ def query(q: str, chat_id: str | None = None):
         query=q,
         intent=mode,
         status=status,
-        confidence="N/A",
     )
 
     if chat_id:

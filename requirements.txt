@@ -2,9 +2,6 @@ fastapi
 uvicorn
 python-telegram-bot==20.7
 requests
-beautifulsoup4
 redis
 python-dotenv
-langdetect
 jinja2
-pypdf
