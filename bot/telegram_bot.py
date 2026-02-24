@@ -14,7 +14,7 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
-    ApplicationBuilder,
+    ApplicationBuilder,  
     CommandHandler,
     MessageHandler,
     filters,
@@ -58,8 +58,7 @@ SHORTCUT_QUERIES = {
     "circulars": "AKTU Circulars :- https://aktu.ac.in/circulars.html",
 }
 BOT_COMMANDS = [
-    BotCommand("start", "Start bot"),
-    BotCommand("fresh", "Start fresh session"),
+    BotCommand("start", "Start bot or clear cache"),
     BotCommand("result", "Get result link"),
     BotCommand("calendar", "Get academic calendar"),
     BotCommand("admission", "Get admission link"),
@@ -71,7 +70,7 @@ REPLY_SHORTCUT_ROWS = [
     ["/result", "/calendar"],
     ["/admission", "/fee"],
     ["/syllabus", "/circulars"],
-    ["/fresh"],
+    ["/start"],
 ]
 
 
@@ -114,8 +113,8 @@ def reset_backend_session(chat_id: str):
 def get_start_text():
     return (
         "Hello!\n"
-        "Here for any AKTU and AKGEC updates.\n"
-        "You can also use the shortcut keyboard or type '/'."
+        "Here for any AKTU and AKGEC updates?\n"
+        "You can also use the shortcut keyboard or directly type '/'."
     )
 
 
@@ -161,15 +160,6 @@ async def start(update: Update, context):
         _reset_local_session(chat_id)
     if update.message:
         await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
-
-
-async def handle_fresh_command(update: Update, context):
-    if not update.message or not update.effective_chat:
-        return
-    chat_id = update.effective_chat.id
-    reset_backend_session(str(chat_id))
-    _reset_local_session(chat_id)
-    await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
 
 
 async def _run_query(message, context, chat_id: int, q: str):
@@ -276,7 +266,6 @@ async def _post_init(application):
 def _build_application():
     app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("fresh", handle_fresh_command))
     app.add_handler(CommandHandler("result", handle_shortcut_command))
     app.add_handler(CommandHandler("calendar", handle_shortcut_command))
     app.add_handler(CommandHandler("admission", handle_shortcut_command))
