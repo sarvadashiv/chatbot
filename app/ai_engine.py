@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import logging
 import re
@@ -21,13 +22,12 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 VALID_QUERY_MODES = {"smalltalk", "official_info"}
-UNWANTED_SOURCE_HOST_SUBSTRINGS = {
-    "vertexaisearch.cloud.google.com",
-    "vercel.app",
-}
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 URL_VERIFY_TIMEOUT_SECONDS = 8
 LINK_RETRY_ATTEMPTS = 1
+MAX_VERIFIED_GROUNDING_SOURCES = 8
+MAX_RESPONSE_SOURCES = 5
+MAX_PARALLEL_LINK_VERIFICATIONS = 4
 URL_CHECK_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -82,11 +82,6 @@ def _normalize_extracted_url(url: str) -> str:
     return normalized.strip()
 
 
-def _is_blocked_source_host(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return any(blocked in host for blocked in UNWANTED_SOURCE_HOST_SUBSTRINGS)
-
-
 def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECONDS) -> str:
     candidate = _resolve_redirect_url(url, timeout_seconds=timeout_seconds)
     if not candidate:
@@ -95,9 +90,6 @@ def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECO
     parsed = urlparse(candidate)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
-    if _is_blocked_source_host(candidate):
-        return ""
-
     for method in ("get", "head"):
         try:
             if method == "get":
@@ -121,8 +113,6 @@ def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECO
             response.close()
             if not final_url:
                 continue
-            if _is_blocked_source_host(final_url):
-                continue
             if status < 400 and method == "get":
                 return final_url
             if status < 400 and method == "head":
@@ -140,11 +130,7 @@ def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECO
                         timeout_seconds=timeout_seconds,
                     )
                     confirm.close()
-                    if (
-                        confirm_status < 400
-                        and confirm_final
-                        and not _is_blocked_source_host(confirm_final)
-                    ):
+                    if confirm_status < 400 and confirm_final:
                         return confirm_final
                 except requests.exceptions.RequestException:
                     continue
@@ -160,6 +146,29 @@ def _verify_working_url_cached(url: str, cache: dict[str, str]) -> str:
         return cached
     verified = _verify_working_url(url)
     cache[url] = verified
+    return verified
+
+
+def _verify_urls_parallel(urls: list[str]) -> dict[str, str]:
+    if not urls:
+        return {}
+
+    worker_count = min(MAX_PARALLEL_LINK_VERIFICATIONS, len(urls))
+    if worker_count <= 1:
+        return {url: _verify_working_url(url) for url in urls}
+
+    verified: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_url = {
+            executor.submit(_verify_working_url, url): url
+            for url in urls
+        }
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                verified[url] = future.result()
+            except Exception:
+                verified[url] = ""
     return verified
 
 
@@ -180,19 +189,16 @@ def _pick_alternative_source_url(sources: list[dict[str, str]], failed_urls: lis
         return ""
 
     failed_set = {_normalize_extracted_url(url) for url in failed_urls}
-    cache: dict[str, str] = {}
     for source in sources:
         if not isinstance(source, dict):
             continue
-        source_url = str(source.get("url", "")).strip()
+        source_url = _normalize_extracted_url(str(source.get("url", "")))
         if not source_url:
             continue
-        verified = _verify_working_url_cached(source_url, cache)
-        if not verified:
+        # Grounding sources are already verified in _extract_grounding_sources.
+        if source_url in failed_set:
             continue
-        if _normalize_extracted_url(verified) in failed_set:
-            continue
-        return verified
+        return source_url
     return ""
 
 
@@ -213,7 +219,16 @@ def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
     if not matches:
         return answer, False, []
 
-    cache: dict[str, str] = {}
+    urls_to_verify: list[str] = []
+    seen_urls_to_verify: set[str] = set()
+    for match in matches:
+        normalized = _normalize_extracted_url(match.group(0))
+        if not normalized or normalized in seen_urls_to_verify:
+            continue
+        seen_urls_to_verify.add(normalized)
+        urls_to_verify.append(normalized)
+    verified_by_url = _verify_urls_parallel(urls_to_verify)
+
     out_parts: list[str] = []
     removed_unverified = False
     failed_urls: list[str] = []
@@ -227,7 +242,7 @@ def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
             continue
 
         out_parts.append(answer[cursor:match.start()])
-        verified = _verify_working_url_cached(normalized, cache)
+        verified = verified_by_url.get(normalized, "")
         trailing = raw[len(normalized):] if raw.startswith(normalized) else ""
 
         if verified:
@@ -375,7 +390,7 @@ def _extract_object_like_field(text: str, field: str) -> str | None:
 
 def _build_system_prompt(today: str) -> str:
     return (
-        "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo divert user towards asking AKTU/AKGEC related queries. "
+        "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo, divert user towards asking AKTU/AKGEC related queries. "
         f"Today's date (UTC) is {today}. "
         "Use the live Google Search grounding tool to research factual claims. Provide endpoint urls for user to get to their destination directly. DO NOT instruct them how to reach to link, provide them direct link."
         "Do not refuse to share any AKTU/AKGEC links. MUST VERIFY that the link is correct and working(no errors like 403) before giving a response."
@@ -466,18 +481,22 @@ def _extract_grounding_sources(candidate: dict[str, Any]) -> list[dict[str, str]
     metadata = candidate.get("groundingMetadata") or {}
     chunks = metadata.get("groundingChunks") or []
     sources: list[dict[str, str]] = []
+    seen_input_urls: set[str] = set()
     seen_urls: set[str] = set()
     validation_cache: dict[str, str] = {}
 
     for chunk in chunks:
+        if len(sources) >= MAX_VERIFIED_GROUNDING_SOURCES:
+            break
         if not isinstance(chunk, dict):
             continue
         web = chunk.get("web") or {}
         if not isinstance(web, dict):
             continue
         url = str(web.get("uri", "")).strip()
-        if not url or url in seen_urls:
+        if not url or url in seen_input_urls:
             continue
+        seen_input_urls.add(url)
         resolved_url = _verify_working_url_cached(url, validation_cache)
         if not resolved_url:
             continue
@@ -676,7 +695,7 @@ def _append_sources(answer: str, sources: list[dict[str, str]]) -> str:
         return answer
 
     lines = [answer, "", "Sources:"]
-    for source in sources[:5]:
+    for source in sources[:MAX_RESPONSE_SOURCES]:
         lines.append(f"- {source['title']}: {source['url']}")
     return "\n".join(lines).strip()
 
@@ -746,14 +765,16 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
             mode = nested_mode
             answer = nested_answer
     answer, removed_unverified_links, failed_urls = _sanitize_answer_links(answer)
+    has_answer_urls = bool(_extract_urls(answer))
     sources = result.get("sources", [])
-    if removed_unverified_links and not _extract_urls(answer):
+    if removed_unverified_links and not has_answer_urls:
         alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
         if alternative_source_url:
             answer = _append_official_link(answer, alternative_source_url)
             removed_unverified_links = False
+            has_answer_urls = True
 
-    if removed_unverified_links and not _extract_urls(answer):
+    if removed_unverified_links and not has_answer_urls:
         try:
             (
                 retry_mode,
@@ -770,11 +791,13 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
                 answer = retry_answer
                 sources = retry_sources
                 removed_unverified_links = retry_removed_unverified
-                if removed_unverified_links and not _extract_urls(answer):
+                has_answer_urls = bool(_extract_urls(answer))
+                if removed_unverified_links and not has_answer_urls:
                     alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
                     if alternative_source_url:
                         answer = _append_official_link(answer, alternative_source_url)
                         removed_unverified_links = False
+                        has_answer_urls = True
         except Exception as exc:
             logger.warning(
                 "Alternative link retry failed type=%s detail=%s",
@@ -783,7 +806,7 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
             )
 
     answer = _append_sources(answer, sources)
-    if removed_unverified_links and not _extract_urls(answer):
+    if removed_unverified_links and not has_answer_urls:
         note = "I could not verify a working official link right now."
         answer = f"{answer}\n\n{note}".strip()
     if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:

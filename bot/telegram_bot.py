@@ -43,7 +43,16 @@ RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
 LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
-QUERY_TIMEOUT_SECONDS = int(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
+_legacy_backend_timeout = float(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
+BACKEND_CONNECT_TIMEOUT_SECONDS = float(os.getenv("BACKEND_CONNECT_TIMEOUT_SECONDS", "5"))
+BACKEND_READ_TIMEOUT_SECONDS = float(
+    os.getenv(
+        "BACKEND_READ_TIMEOUT_SECONDS",
+        str(max(_legacy_backend_timeout, 90.0)),
+    )
+)
+BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "1"))
+BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1.0"))
 SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", True)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
@@ -99,6 +108,37 @@ def _active_reply_markup(chat_id: int | None = None):
     if SHOW_REPLY_SHORTCUT_KEYBOARD:
         return _reply_shortcut_keyboard()
     return None
+
+
+async def _fetch_backend_answer(params: dict[str, str]) -> str:
+    total_attempts = max(0, BACKEND_REQUEST_RETRIES) + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                API_URL,
+                params=params,
+                timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("answer", "I could not process your request right now.")
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
+            if attempt >= total_attempts:
+                raise
+            sleep_for = BACKEND_RETRY_DELAY_SECONDS * attempt
+            logging.warning(
+                "Backend transient failure type=%s attempt=%s/%s retry_in=%.2fs",
+                type(exc).__name__,
+                attempt,
+                total_attempts,
+                sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
 
 
 def reset_backend_session(chat_id: str):
@@ -183,15 +223,7 @@ async def _run_query(message, context, chat_id: int, q: str):
         try:
             if USE_BACKEND_API:
                 try:
-                    response = await asyncio.to_thread(
-                        requests.get,
-                        API_URL,
-                        params=params,
-                        timeout=QUERY_TIMEOUT_SECONDS,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    answer = data.get("answer", "I could not process your request right now.")
+                    answer = await _fetch_backend_answer(params)
                     _set_local_previous_user_text(chat_id, q)
                 except requests.exceptions.RequestException:
                     logging.exception("Backend request failed")
