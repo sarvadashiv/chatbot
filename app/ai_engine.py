@@ -289,11 +289,12 @@ def _retry_for_alternative_link(
     user_text: str,
     previous_user_text: str,
     failed_urls: list[str],
-) -> tuple[str, str, list[dict[str, str]], bool]:
+) -> tuple[str, str, list[dict[str, str]], bool, str]:
     mode = "official_info"
     answer = ""
     sources: list[dict[str, str]] = []
     removed_unverified_links = False
+    raw_text = ""
 
     for _ in range(LINK_RETRY_ATTEMPTS):
         retry_result = _chat(
@@ -313,6 +314,7 @@ def _retry_for_alternative_link(
             ],
             timeout=45,
         )
+        raw_text = str(retry_result.get("text", "")).strip()
 
         mode, answer = _parse_mode_answer(retry_result["text"])
         if answer.startswith("{") and ("\"answer\"" in answer or "'answer'" in answer):
@@ -327,7 +329,7 @@ def _retry_for_alternative_link(
         if _extract_urls(answer) or sources:
             break
 
-    return mode, answer, sources, removed_unverified_links
+    return mode, answer, sources, removed_unverified_links, raw_text
 
 
 def _scan_quoted_value(text: str, start: int, quote: str) -> tuple[str | None, int]:
@@ -739,7 +741,7 @@ def _parse_mode_answer(raw_text: str) -> tuple[str, str]:
     return mode, answer
 
 
-def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[str, str]:
+def _classify_and_reply_internal(user_text: str, previous_user_text: str = "") -> dict[str, Any]:
     user_content = user_text
     if previous_user_text:
         user_content = (
@@ -758,6 +760,7 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
         ],
         timeout=45,
     )
+    raw_answer = str(result.get("text", "")).strip()
     mode, answer = _parse_mode_answer(result["text"])
     if answer.startswith("{") and ("\"answer\"" in answer or "'answer'" in answer):
         nested_mode, nested_answer = _parse_mode_answer(answer)
@@ -781,6 +784,7 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
                 retry_answer,
                 retry_sources,
                 retry_removed_unverified,
+                retry_raw_text,
             ) = _retry_for_alternative_link(
                 user_text=user_text,
                 previous_user_text=previous_user_text,
@@ -791,6 +795,8 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
                 answer = retry_answer
                 sources = retry_sources
                 removed_unverified_links = retry_removed_unverified
+                if retry_raw_text:
+                    raw_answer = retry_raw_text
                 has_answer_urls = bool(_extract_urls(answer))
                 if removed_unverified_links and not has_answer_urls:
                     alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
@@ -813,4 +819,17 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
         answer = (
             f"{answer}"
         )
-    return mode, answer
+    return {
+        "mode": mode,
+        "answer": answer,
+        "raw_answer": raw_answer,
+    }
+
+
+def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[str, str]:
+    result = _classify_and_reply_internal(user_text, previous_user_text=previous_user_text)
+    return str(result["mode"]), str(result["answer"])
+
+
+def classify_and_reply_debug(user_text: str, previous_user_text: str = "") -> dict[str, Any]:
+    return _classify_and_reply_internal(user_text, previous_user_text=previous_user_text)
