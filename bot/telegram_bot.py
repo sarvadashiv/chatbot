@@ -41,6 +41,8 @@ BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000").rstrip
 API_URL = f"{BACKEND_BASE_URL}/query"
 RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
+BACKEND_HEADERS = {"X-API-Key": BACKEND_API_KEY} if BACKEND_API_KEY else {}
 USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
 LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
 _legacy_backend_timeout = float(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
@@ -58,6 +60,8 @@ TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
 _local_previous_user_text: dict[int, str] = {}
+if USE_BACKEND_API and not BACKEND_API_KEY:
+    logging.warning("BACKEND_API_KEY is not set; backend requests may be rejected.")
 SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
     "calendar": "Calendar :- https://www.akgec.ac.in/academics/academic-calendar/",
@@ -118,6 +122,7 @@ async def _fetch_backend_answer(params: dict[str, str]) -> str:
                 requests.get,
                 API_URL,
                 params=params,
+                headers=BACKEND_HEADERS,
                 timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
             )
             response.raise_for_status()
@@ -145,7 +150,7 @@ def reset_backend_session(chat_id: str):
     if not USE_BACKEND_API:
         return
     try:
-        requests.post(RESET_URL, params={"chat_id": chat_id}, timeout=10)
+        requests.post(RESET_URL, params={"chat_id": chat_id}, headers=BACKEND_HEADERS, timeout=10)
     except requests.exceptions.RequestException:
         logging.exception("Failed to reset backend session")
 

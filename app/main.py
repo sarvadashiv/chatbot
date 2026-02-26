@@ -1,30 +1,46 @@
 import json
 import logging #backend logs
+import secrets
 
 import requests #catch req related exceptions
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from app import ai_engine
 from app.cache import delete_cache, delete_cache_by_prefix, get_cache, set_cache
-from app.config import LIVE_SEARCH_BYPASS_CACHE, QUERY_CACHE_TTL_SECONDS
+from app.config import BACKEND_API_KEY, LIVE_SEARCH_BYPASS_CACHE, QUERY_CACHE_TTL_SECONDS
 from app.db.logger import init_db, log_query
 from app.dashboard.routes import router as dashboard_router
 
 logger = logging.getLogger(__name__)
+
+
+def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    if not BACKEND_API_KEY:
+        logger.error("BACKEND_API_KEY is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Backend authentication is not configured.",
+        )
+    if not x_api_key or not secrets.compare_digest(x_api_key, BACKEND_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key.",
+        )
+
 
 app = FastAPI()
 init_db()
 app.include_router(dashboard_router)
 
 
-@app.post("/reset_session")
+@app.post("/reset_session", dependencies=[Depends(_require_api_key)])
 def reset_session(chat_id: str):
     delete_cache(f"ctx:{chat_id}")
     delete_cache_by_prefix(f"q:{chat_id}:")
     return {"ok": True, "message": "Session reset"}
 
 
-@app.get("/query")
+@app.get("/query", dependencies=[Depends(_require_api_key)])
 def query(q: str, chat_id: str | None = None):
     cache_key = f"q:{chat_id}:{q}" if chat_id else f"q:{q}"
     use_cache = not LIVE_SEARCH_BYPASS_CACHE
