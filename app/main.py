@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 from app import ai_engine
 from app.cache import delete_cache, delete_cache_by_prefix, get_cache, set_cache
-from app.config import EXPOSE_RAW_AI_RESPONSE, LIVE_SEARCH_BYPASS_CACHE, QUERY_CACHE_TTL_SECONDS
+from app.config import LIVE_SEARCH_BYPASS_CACHE, QUERY_CACHE_TTL_SECONDS
 from app.db.logger import init_db, log_query
 from app.dashboard.routes import router as dashboard_router
 
@@ -25,16 +25,13 @@ def reset_session(chat_id: str):
 
 
 @app.get("/query")
-def query(q: str, chat_id: str | None = None, debug_raw: bool = False):
+def query(q: str, chat_id: str | None = None):
     cache_key = f"q:{chat_id}:{q}" if chat_id else f"q:{q}"
     use_cache = not LIVE_SEARCH_BYPASS_CACHE
     cached = get_cache(cache_key) if use_cache else None
 
     if cached:
-        payload = {"answer": cached}
-        if debug_raw and EXPOSE_RAW_AI_RESPONSE:
-            payload["raw_answer"] = ""
-        return payload
+        return {"answer": cached}
 
     previous_user_text = ""
     if chat_id:
@@ -46,21 +43,13 @@ def query(q: str, chat_id: str | None = None, debug_raw: bool = False):
                 previous_user_text = ""
 
     try:
-        raw_answer = ""
-        if debug_raw and EXPOSE_RAW_AI_RESPONSE:
-            debug_result = ai_engine.classify_and_reply_debug(q, previous_user_text=previous_user_text)
-            mode = str(debug_result.get("mode", "official_info"))
-            reply = str(debug_result.get("answer", ""))
-            raw_answer = str(debug_result.get("raw_answer", ""))
-        else:
-            mode, reply = ai_engine.classify_and_reply(q, previous_user_text=previous_user_text)
+        mode, reply = ai_engine.classify_and_reply(q, previous_user_text=previous_user_text)
         status = "AI_ONE_CALL"
     except requests.exceptions.HTTPError as exc:
         response = exc.response
         status_code = response.status_code if response is not None else None
         logger.error("classify_and_reply failed type=%s status=%s", type(exc).__name__, status_code)
         mode = "official_info"
-        raw_answer = ""
         if status_code == 429:
             reply = "AI quota is currently exhausted. Please try again shortly."
             status = "LLM_QUOTA_EXCEEDED"
@@ -70,13 +59,11 @@ def query(q: str, chat_id: str | None = None, debug_raw: bool = False):
     except requests.exceptions.RequestException as exc:
         logger.error("classify_and_reply failed type=%s", type(exc).__name__)
         mode = "official_info"
-        raw_answer = ""
         reply = "AI service is taking too long right now. Please try again."
         status = "LLM_TIMEOUT"
     except RuntimeError as exc:
         logger.error("classify_and_reply failed type=%s", type(exc).__name__)
         mode = "official_info"
-        raw_answer = ""
         if "currently unavailable" in str(exc).lower():
             reply = "All configured AI models are temporarily unavailable. Please try again later."
             status = "LLM_MODELS_UNAVAILABLE"
@@ -94,7 +81,4 @@ def query(q: str, chat_id: str | None = None, debug_raw: bool = False):
         set_cache(f"ctx:{chat_id}", json.dumps({"last_user_query": q}), 86400)
     if use_cache and QUERY_CACHE_TTL_SECONDS > 0:
         set_cache(cache_key, reply, QUERY_CACHE_TTL_SECONDS)
-    payload = {"answer": reply}
-    if debug_raw and EXPOSE_RAW_AI_RESPONSE:
-        payload["raw_answer"] = raw_answer
-    return payload
+    return {"answer": reply}

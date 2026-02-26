@@ -54,7 +54,6 @@ BACKEND_READ_TIMEOUT_SECONDS = float(
 BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "1"))
 BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1.0"))
 SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", True)
-SHOW_RAW_AND_FINAL_RESPONSE = _env_bool("SHOW_RAW_AND_FINAL_RESPONSE", False)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -111,27 +110,19 @@ def _active_reply_markup(chat_id: int | None = None):
     return None
 
 
-async def _fetch_backend_answer(params: dict[str, str]) -> dict[str, str]:
-    request_params = dict(params)
-    if SHOW_RAW_AND_FINAL_RESPONSE:
-        request_params["debug_raw"] = "1"
-
+async def _fetch_backend_answer(params: dict[str, str]) -> str:
     total_attempts = max(0, BACKEND_REQUEST_RETRIES) + 1
     for attempt in range(1, total_attempts + 1):
         try:
             response = await asyncio.to_thread(
                 requests.get,
                 API_URL,
-                params=request_params,
+                params=params,
                 timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
             )
             response.raise_for_status()
             data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError("Backend JSON response must be an object.")
-            if "answer" not in data:
-                data["answer"] = "I could not process your request right now."
-            return data
+            return data.get("answer", "I could not process your request right now.")
         except (
             requests.exceptions.ReadTimeout,
             requests.exceptions.ConnectTimeout,
@@ -232,12 +223,7 @@ async def _run_query(message, context, chat_id: int, q: str):
         try:
             if USE_BACKEND_API:
                 try:
-                    backend_data = await _fetch_backend_answer(params)
-                    answer = str(backend_data.get("answer", "I could not process your request right now."))
-                    if SHOW_RAW_AND_FINAL_RESPONSE:
-                        raw_answer = str(backend_data.get("raw_answer", "")).strip()
-                        if raw_answer:
-                            answer = f"AI raw response:\n{raw_answer}\n\nBot response:\n{answer}"
+                    answer = await _fetch_backend_answer(params)
                     _set_local_previous_user_text(chat_id, q)
                 except requests.exceptions.RequestException:
                     logging.exception("Backend request failed")
@@ -251,22 +237,11 @@ async def _run_query(message, context, chat_id: int, q: str):
             if answer is None:
                 try:
                     previous_user_text = _get_local_previous_user_text(chat_id)
-                    if SHOW_RAW_AND_FINAL_RESPONSE:
-                        debug_result = await asyncio.to_thread(
-                            ai_engine.classify_and_reply_debug,
-                            q,
-                            previous_user_text,
-                        )
-                        answer = str(debug_result.get("answer", "I could not process your request right now."))
-                        raw_answer = str(debug_result.get("raw_answer", "")).strip()
-                        if raw_answer:
-                            answer = f"AI raw response:\n{raw_answer}\n\nBot response:\n{answer}"
-                    else:
-                        _, answer = await asyncio.to_thread(
-                            ai_engine.classify_and_reply,
-                            q,
-                            previous_user_text,
-                        )
+                    _, answer = await asyncio.to_thread(
+                        ai_engine.classify_and_reply,
+                        q,
+                        previous_user_text,
+                    )
                     _set_local_previous_user_text(chat_id, q)
                 except Exception:
                     logging.exception("Local AI fallback failed")
