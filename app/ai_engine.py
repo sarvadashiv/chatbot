@@ -1,5 +1,4 @@
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import logging
 import re
@@ -23,18 +22,13 @@ logger = logging.getLogger(__name__)
 
 VALID_QUERY_MODES = {"smalltalk", "official_info"}
 URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
-URL_VERIFY_TIMEOUT_SECONDS = 8
 LINK_RETRY_ATTEMPTS = 1
 MAX_VERIFIED_GROUNDING_SOURCES = 8
 MAX_RESPONSE_SOURCES = 5
-MAX_PARALLEL_LINK_VERIFICATIONS = 4
-URL_CHECK_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    )
-}
+ALLOWED_GROUNDING_DOMAINS = ("aktu.ac.in", "akgec.ac.in")
+ALLOWED_GROUNDING_DOMAINS_DISPLAY = ", ".join(
+    f"https://{domain}" for domain in ALLOWED_GROUNDING_DOMAINS
+)
 MODEL_RETRY_AFTER_PATTERN = re.compile(r"please retry in ([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 MODEL_MIN_COOLDOWN_SECONDS = 30.0
 MODEL_LONG_COOLDOWN_SECONDS = 3600.0
@@ -43,7 +37,7 @@ _MODEL_PERMANENTLY_UNAVAILABLE: set[str] = set()
 _MODEL_STATE_LOCK = threading.Lock()
 
 
-def _resolve_redirect_url(url: str, timeout_seconds: int = 6) -> str:
+def _resolve_redirect_url(url: str) -> str:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     for key in ("url", "q", "u"):
@@ -52,23 +46,6 @@ def _resolve_redirect_url(url: str, timeout_seconds: int = 6) -> str:
             candidate = values[0].strip()
             if candidate.startswith("http://") or candidate.startswith("https://"):
                 return candidate
-
-    host = parsed.netloc.lower()
-    path = parsed.path.lower()
-    if "vertexaisearch.cloud.google.com" in host and "grounding-api-redirect" in path:
-        for method in ("head", "get"):
-            try:
-                if method == "head":
-                    response = requests.head(url, allow_redirects=True, timeout=timeout_seconds)
-                else:
-                    response = requests.get(url, allow_redirects=True, timeout=timeout_seconds, stream=True)
-                final_url = (response.url or "").strip()
-                response.close()
-                if final_url and "vertexaisearch.cloud.google.com" not in final_url.lower():
-                    return final_url
-            except requests.exceptions.RequestException:
-                continue
-        return ""
 
     return url
 
@@ -82,62 +59,29 @@ def _normalize_extracted_url(url: str) -> str:
     return normalized.strip()
 
 
-def _verify_working_url(url: str, timeout_seconds: int = URL_VERIFY_TIMEOUT_SECONDS) -> str:
-    candidate = _resolve_redirect_url(url, timeout_seconds=timeout_seconds)
+def _is_allowed_grounding_host(host: str) -> bool:
+    normalized_host = host.lower().split(":", 1)[0]
+    return any(
+        normalized_host == domain or normalized_host.endswith(f".{domain}")
+        for domain in ALLOWED_GROUNDING_DOMAINS
+    )
+
+
+def _is_allowed_grounding_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+        and _is_allowed_grounding_host(parsed.netloc)
+    )
+
+
+def _verify_working_url(url: str) -> str:
+    candidate = _normalize_extracted_url(_resolve_redirect_url(url))
     if not candidate:
         return ""
 
-    parsed = urlparse(candidate)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return ""
-    for method in ("get", "head"):
-        try:
-            if method == "get":
-                response = requests.get(
-                    candidate,
-                    allow_redirects=True,
-                    timeout=timeout_seconds,
-                    stream=True,
-                    headers=URL_CHECK_HEADERS,
-                )
-            else:
-                response = requests.head(
-                    candidate,
-                    allow_redirects=True,
-                    timeout=timeout_seconds,
-                    headers=URL_CHECK_HEADERS,
-                )
-
-            status = response.status_code
-            final_url = _resolve_redirect_url((response.url or "").strip(), timeout_seconds=timeout_seconds)
-            response.close()
-            if not final_url:
-                continue
-            if status < 400 and method == "get":
-                return final_url
-            if status < 400 and method == "head":
-                try:
-                    confirm = requests.get(
-                        final_url,
-                        allow_redirects=True,
-                        timeout=timeout_seconds,
-                        stream=True,
-                        headers=URL_CHECK_HEADERS,
-                    )
-                    confirm_status = confirm.status_code
-                    confirm_final = _resolve_redirect_url(
-                        (confirm.url or "").strip(),
-                        timeout_seconds=timeout_seconds,
-                    )
-                    confirm.close()
-                    if confirm_status < 400 and confirm_final:
-                        return confirm_final
-                except requests.exceptions.RequestException:
-                    continue
-        except requests.exceptions.RequestException:
-            continue
-
-    return ""
+    return candidate if _is_allowed_grounding_url(candidate) else ""
 
 
 def _verify_working_url_cached(url: str, cache: dict[str, str]) -> str:
@@ -146,29 +90,6 @@ def _verify_working_url_cached(url: str, cache: dict[str, str]) -> str:
         return cached
     verified = _verify_working_url(url)
     cache[url] = verified
-    return verified
-
-
-def _verify_urls_parallel(urls: list[str]) -> dict[str, str]:
-    if not urls:
-        return {}
-
-    worker_count = min(MAX_PARALLEL_LINK_VERIFICATIONS, len(urls))
-    if worker_count <= 1:
-        return {url: _verify_working_url(url) for url in urls}
-
-    verified: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_to_url = {
-            executor.submit(_verify_working_url, url): url
-            for url in urls
-        }
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                verified[url] = future.result()
-            except Exception:
-                verified[url] = ""
     return verified
 
 
@@ -194,6 +115,8 @@ def _pick_alternative_source_url(sources: list[dict[str, str]], failed_urls: lis
             continue
         source_url = _normalize_extracted_url(str(source.get("url", "")))
         if not source_url:
+            continue
+        if not _is_allowed_grounding_url(source_url):
             continue
         # Grounding sources are already verified in _extract_grounding_sources.
         if source_url in failed_set:
@@ -227,7 +150,7 @@ def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
             continue
         seen_urls_to_verify.add(normalized)
         urls_to_verify.append(normalized)
-    verified_by_url = _verify_urls_parallel(urls_to_verify)
+    verified_by_url = {url: _verify_working_url(url) for url in urls_to_verify}
 
     out_parts: list[str] = []
     removed_unverified = False
@@ -268,7 +191,11 @@ def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
 
 def _build_retry_user_content(user_text: str, previous_user_text: str, failed_urls: list[str]) -> str:
     lines = [
-        "Previous answer had links that failed live verification (HTTP 4xx/5xx, including 403).",
+        "Previous answer had links that did not match official domain policy.",
+        (
+            "Use ONLY official sources from these domains (including subdomains): "
+            f"{ALLOWED_GROUNDING_DOMAINS_DISPLAY}."
+        ),
     ]
     if failed_urls:
         lines.append(f"Failed URLs: {', '.join(failed_urls)}")
@@ -277,10 +204,10 @@ def _build_retry_user_content(user_text: str, previous_user_text: str, failed_ur
         lines.append(f"Previous user message: {previous_user_text}")
     lines.append(f"Current user message: {user_text}")
     lines.append(
-        "Search again and provide an alternative official direct endpoint URL that is currently reachable."
+        "Search again and provide an alternative official direct endpoint URL."
     )
     lines.append(
-        "If no verified official URL can be found right now, say that clearly."
+        "If no official-domain URL can be found right now, say that clearly."
     )
     return "\n".join(lines)
 
@@ -391,10 +318,10 @@ def _extract_object_like_field(text: str, field: str) -> str | None:
 def _build_system_prompt(today: str) -> str:
     return (
         "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo, divert user towards asking AKTU/AKGEC related queries. "
-        f"Today's date (UTC) is {today}. "
-        "Use the live Google Search grounding tool to research factual claims. Provide endpoint urls for user to get to their destination directly. DO NOT instruct them how to reach to link, provide them direct link."
-        "Do not refuse to share any AKTU/AKGEC links. MUST VERIFY that the link is correct and working(no errors like 403) before giving a response."
-        "Do not guess; if you cannot verify a claim, say that clearly. "
+        f"Today's date (UTC) is {today}."
+        f"sources from these domains (including subdomains): {ALLOWED_GROUNDING_DOMAINS_DISPLAY}."
+        "Provide endpoint urls for user to get to their destination directly. DO NOT instruct them how to reach to link, provide them direct link."
+        "Do not guess; if you cannot verify a claim, say that clearly."
         "Return ONLY valid JSON with exactly two keys: mode and answer. "
         "No markdown, no code fences, no extra keys.\n"
         "Output contract:\n"
@@ -807,7 +734,7 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
 
     answer = _append_sources(answer, sources)
     if removed_unverified_links and not has_answer_urls:
-        note = "I could not verify a working official link right now."
+        note = "I could not find an official-domain link for this response."
         answer = f"{answer}\n\n{note}".strip()
     if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
         answer = (
