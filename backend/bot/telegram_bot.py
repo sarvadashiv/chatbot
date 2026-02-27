@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from telegram import (
     BotCommand,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ChatAction
@@ -55,7 +56,7 @@ BACKEND_READ_TIMEOUT_SECONDS = float(
 )
 BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "1"))
 BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1.0"))
-SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", True)
+SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", False)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
@@ -111,7 +112,7 @@ def _reply_shortcut_keyboard():
 def _active_reply_markup(chat_id: int | None = None):
     if SHOW_REPLY_SHORTCUT_KEYBOARD:
         return _reply_shortcut_keyboard()
-    return None
+    return ReplyKeyboardRemove()
 
 
 async def _fetch_backend_answer(params: dict[str, str]) -> str:

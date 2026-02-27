@@ -5,7 +5,7 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import requests
 from app.config import (
@@ -21,8 +21,6 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 VALID_QUERY_MODES = {"smalltalk", "official_info"}
-URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
-LINK_RETRY_ATTEMPTS = 1
 MAX_VERIFIED_GROUNDING_SOURCES = 8
 MAX_RESPONSE_SOURCES = 5
 ALLOWED_GROUNDING_DOMAINS = ("aktu.ac.in", "akgec.ac.in")
@@ -35,28 +33,6 @@ MODEL_LONG_COOLDOWN_SECONDS = 3600.0
 _MODEL_SKIP_UNTIL: dict[str, float] = {}
 _MODEL_PERMANENTLY_UNAVAILABLE: set[str] = set()
 _MODEL_STATE_LOCK = threading.Lock()
-
-
-def _resolve_redirect_url(url: str) -> str:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    for key in ("url", "q", "u"):
-        values = query.get(key) or []
-        if values:
-            candidate = values[0].strip()
-            if candidate.startswith("http://") or candidate.startswith("https://"):
-                return candidate
-
-    return url
-
-
-def _normalize_extracted_url(url: str) -> str:
-    normalized = url.strip()
-    while normalized and normalized[-1] in ",.;:!?]}":
-        normalized = normalized[:-1]
-    while normalized.endswith(")") and normalized.count("(") < normalized.count(")"):
-        normalized = normalized[:-1]
-    return normalized.strip()
 
 
 def _is_allowed_grounding_host(host: str) -> bool:
@@ -77,7 +53,7 @@ def _is_allowed_grounding_url(url: str) -> bool:
 
 
 def _verify_working_url(url: str) -> str:
-    candidate = _normalize_extracted_url(_resolve_redirect_url(url))
+    candidate = url.strip()
     if not candidate:
         return ""
 
@@ -91,170 +67,6 @@ def _verify_working_url_cached(url: str, cache: dict[str, str]) -> str:
     verified = _verify_working_url(url)
     cache[url] = verified
     return verified
-
-
-def _extract_urls(text: str) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for match in URL_PATTERN.finditer(text):
-        normalized = _normalize_extracted_url(match.group(0))
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        urls.append(normalized)
-    return urls
-
-
-def _pick_alternative_source_url(sources: list[dict[str, str]], failed_urls: list[str]) -> str:
-    if not sources:
-        return ""
-
-    failed_set = {_normalize_extracted_url(url) for url in failed_urls}
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        source_url = _normalize_extracted_url(str(source.get("url", "")))
-        if not source_url:
-            continue
-        if not _is_allowed_grounding_url(source_url):
-            continue
-        # Grounding sources are already verified in _extract_grounding_sources.
-        if source_url in failed_set:
-            continue
-        return source_url
-    return ""
-
-
-def _append_official_link(answer: str, url: str) -> str:
-    link_line = f"Official link: {url}"
-    if not answer:
-        return link_line
-    if url in answer:
-        return answer
-    return f"{answer}\n\n{link_line}".strip()
-
-
-def _sanitize_answer_links(answer: str) -> tuple[str, bool, list[str]]:
-    if not answer:
-        return answer, False, []
-
-    matches = list(URL_PATTERN.finditer(answer))
-    if not matches:
-        return answer, False, []
-
-    urls_to_verify: list[str] = []
-    seen_urls_to_verify: set[str] = set()
-    for match in matches:
-        normalized = _normalize_extracted_url(match.group(0))
-        if not normalized or normalized in seen_urls_to_verify:
-            continue
-        seen_urls_to_verify.add(normalized)
-        urls_to_verify.append(normalized)
-    verified_by_url = {url: _verify_working_url(url) for url in urls_to_verify}
-
-    out_parts: list[str] = []
-    removed_unverified = False
-    failed_urls: list[str] = []
-    seen_failed_urls: set[str] = set()
-    cursor = 0
-
-    for match in matches:
-        raw = match.group(0)
-        normalized = _normalize_extracted_url(raw)
-        if not normalized:
-            continue
-
-        out_parts.append(answer[cursor:match.start()])
-        verified = verified_by_url.get(normalized, "")
-        trailing = raw[len(normalized):] if raw.startswith(normalized) else ""
-
-        if verified:
-            out_parts.append(f"{verified}{trailing}")
-        else:
-            removed_unverified = True
-            if normalized not in seen_failed_urls:
-                seen_failed_urls.add(normalized)
-                failed_urls.append(normalized)
-            out_parts.append(trailing)
-
-        cursor = match.end()
-
-    out_parts.append(answer[cursor:])
-    sanitized = "".join(out_parts)
-    sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
-    sanitized = re.sub(r"\(\s*\)", "", sanitized)
-    sanitized = re.sub(r"\s+([,.;:!?])", r"\1", sanitized)
-    sanitized = re.sub(r" +\n", "\n", sanitized)
-    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
-    return sanitized, removed_unverified, failed_urls
-
-
-def _build_retry_user_content(user_text: str, previous_user_text: str, failed_urls: list[str]) -> str:
-    lines = [
-        "Previous answer had links that did not match official domain policy.",
-        (
-            "Use ONLY official sources from these domains (including subdomains): "
-            f"{ALLOWED_GROUNDING_DOMAINS_DISPLAY}."
-        ),
-    ]
-    if failed_urls:
-        lines.append(f"Failed URLs: {', '.join(failed_urls)}")
-
-    if previous_user_text:
-        lines.append(f"Previous user message: {previous_user_text}")
-    lines.append(f"Current user message: {user_text}")
-    lines.append(
-        "Search again and provide an alternative official direct endpoint URL."
-    )
-    lines.append(
-        "If no official-domain URL can be found right now, say that clearly."
-    )
-    return "\n".join(lines)
-
-
-def _retry_for_alternative_link(
-    user_text: str,
-    previous_user_text: str,
-    failed_urls: list[str],
-) -> tuple[str, str, list[dict[str, str]], bool]:
-    mode = "official_info"
-    answer = ""
-    sources: list[dict[str, str]] = []
-    removed_unverified_links = False
-
-    for _ in range(LINK_RETRY_ATTEMPTS):
-        retry_result = _chat(
-            [
-                {
-                    "role": "system",
-                    "content": _build_system_prompt(datetime.utcnow().strftime("%B %d, %Y")),
-                },
-                {
-                    "role": "user",
-                    "content": _build_retry_user_content(
-                        user_text=user_text,
-                        previous_user_text=previous_user_text,
-                        failed_urls=failed_urls,
-                    ),
-                },
-            ],
-            timeout=45,
-        )
-
-        mode, answer = _parse_mode_answer(retry_result["text"])
-        if answer.startswith("{") and ("\"answer\"" in answer or "'answer'" in answer):
-            nested_mode, nested_answer = _parse_mode_answer(answer)
-            if nested_answer and nested_answer != answer:
-                mode = nested_mode
-                answer = nested_answer
-
-        answer, removed_unverified_links, retry_failed_urls = _sanitize_answer_links(answer)
-        sources = retry_result.get("sources", [])
-        failed_urls = retry_failed_urls
-        if _extract_urls(answer) or sources:
-            break
-
-    return mode, answer, sources, removed_unverified_links
 
 
 def _scan_quoted_value(text: str, start: int, quote: str) -> tuple[str | None, int]:
@@ -318,9 +130,10 @@ def _extract_object_like_field(text: str, field: str) -> str | None:
 def _build_system_prompt(today: str) -> str:
     return (
         "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo, divert user towards asking AKTU/AKGEC related queries. "
-        f"Today's date (UTC) is {today}."
-        f"sources from these domains (including subdomains): {ALLOWED_GROUNDING_DOMAINS_DISPLAY}."
-        "Provide endpoint urls for user to get to their destination directly. DO NOT instruct them how to reach to link, provide them direct link."
+        f"Today's date (UTC) is {today}. "
+        "Use the live Google Search grounding tool to research factual claims, and ground ONLY from official "
+        f"AKTU/AKGEC domains (including subdomains): {ALLOWED_GROUNDING_DOMAINS_DISPLAY}. "
+        "Provide direct endpoint URLs for users. Do not provide navigation steps."
         "Do not guess; if you cannot verify a claim, say that clearly."
         "Return ONLY valid JSON with exactly two keys: mode and answer. "
         "No markdown, no code fences, no extra keys.\n"
@@ -691,53 +504,6 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
         if nested_answer and nested_answer != answer:
             mode = nested_mode
             answer = nested_answer
-    answer, removed_unverified_links, failed_urls = _sanitize_answer_links(answer)
-    has_answer_urls = bool(_extract_urls(answer))
     sources = result.get("sources", [])
-    if removed_unverified_links and not has_answer_urls:
-        alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
-        if alternative_source_url:
-            answer = _append_official_link(answer, alternative_source_url)
-            removed_unverified_links = False
-            has_answer_urls = True
-
-    if removed_unverified_links and not has_answer_urls:
-        try:
-            (
-                retry_mode,
-                retry_answer,
-                retry_sources,
-                retry_removed_unverified,
-            ) = _retry_for_alternative_link(
-                user_text=user_text,
-                previous_user_text=previous_user_text,
-                failed_urls=failed_urls,
-            )
-            if retry_answer:
-                mode = retry_mode
-                answer = retry_answer
-                sources = retry_sources
-                removed_unverified_links = retry_removed_unverified
-                has_answer_urls = bool(_extract_urls(answer))
-                if removed_unverified_links and not has_answer_urls:
-                    alternative_source_url = _pick_alternative_source_url(sources, failed_urls)
-                    if alternative_source_url:
-                        answer = _append_official_link(answer, alternative_source_url)
-                        removed_unverified_links = False
-                        has_answer_urls = True
-        except Exception as exc:
-            logger.warning(
-                "Alternative link retry failed type=%s detail=%s",
-                type(exc).__name__,
-                str(exc)[:300],
-            )
-
     answer = _append_sources(answer, sources)
-    if removed_unverified_links and not has_answer_urls:
-        note = "I could not find an official-domain link for this response."
-        answer = f"{answer}\n\n{note}".strip()
-    if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
-        answer = (
-            f"{answer}"
-        )
     return mode, answer
