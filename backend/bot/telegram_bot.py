@@ -4,7 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -15,8 +14,10 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
-    ApplicationBuilder,  
+    Application,
+    ApplicationBuilder,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -26,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app import ai_engine
+from app.chat_service import query_chat, reset_chat_session
 
 load_dotenv()
 
@@ -38,31 +39,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:8000").rstrip("/")
-API_URL = f"{BACKEND_BASE_URL}/query"
-RESET_URL = f"{BACKEND_BASE_URL}/reset_session"
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
-BACKEND_HEADERS = {"X-API-Key": BACKEND_API_KEY} if BACKEND_API_KEY else {}
-USE_BACKEND_API = _env_bool("USE_BACKEND_API", True)
-LOCAL_AI_FALLBACK = _env_bool("LOCAL_AI_FALLBACK", not USE_BACKEND_API)
-_legacy_backend_timeout = float(os.getenv("BACKEND_QUERY_TIMEOUT_SECONDS", "45"))
-BACKEND_CONNECT_TIMEOUT_SECONDS = float(os.getenv("BACKEND_CONNECT_TIMEOUT_SECONDS", "5"))
-BACKEND_READ_TIMEOUT_SECONDS = float(
-    os.getenv(
-        "BACKEND_READ_TIMEOUT_SECONDS",
-        str(max(_legacy_backend_timeout, 90.0)),
-    )
-)
-BACKEND_REQUEST_RETRIES = int(os.getenv("BACKEND_REQUEST_RETRIES", "1"))
-BACKEND_RETRY_DELAY_SECONDS = float(os.getenv("BACKEND_RETRY_DELAY_SECONDS", "1.0"))
+TELEGRAM_SECRET_HEADER_NAME = "X-Telegram-Bot-Api-Secret-Token"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 SHOW_REPLY_SHORTCUT_KEYBOARD = _env_bool("SHOW_REPLY_SHORTCUT_KEYBOARD", False)
 TELEGRAM_SEND_RETRIES = 2
 TELEGRAM_SEND_RETRY_DELAY_SECONDS = 1.0
 _chat_locks: dict[int, asyncio.Lock] = {}
-_local_previous_user_text: dict[int, str] = {}
-if USE_BACKEND_API and not BACKEND_API_KEY:
-    logging.warning("BACKEND_API_KEY is not set; backend requests may be rejected.")
 SHORTCUT_QUERIES = {
     "result": "Results :- https://erp.aktu.ac.in/WebPages/OneView/OneView.aspx",
     "calendar": "Calendar :- https://www.akgec.ac.in/academics/academic-calendar/",
@@ -88,18 +70,6 @@ REPLY_SHORTCUT_ROWS = [
 ]
 
 
-def _set_local_previous_user_text(chat_id: int, text: str) -> None:
-    _local_previous_user_text[chat_id] = text
-
-
-def _get_local_previous_user_text(chat_id: int) -> str:
-    return _local_previous_user_text.get(chat_id, "")
-
-
-def _reset_local_session(chat_id: int) -> None:
-    _local_previous_user_text.pop(chat_id, None)
-
-
 def _reply_shortcut_keyboard():
     return ReplyKeyboardMarkup(
         REPLY_SHORTCUT_ROWS,
@@ -113,47 +83,6 @@ def _active_reply_markup(chat_id: int | None = None):
     if SHOW_REPLY_SHORTCUT_KEYBOARD:
         return _reply_shortcut_keyboard()
     return ReplyKeyboardRemove()
-
-
-async def _fetch_backend_answer(params: dict[str, str]) -> str:
-    total_attempts = max(0, BACKEND_REQUEST_RETRIES) + 1
-    for attempt in range(1, total_attempts + 1):
-        try:
-            response = await asyncio.to_thread(
-                requests.get,
-                API_URL,
-                params=params,
-                headers=BACKEND_HEADERS,
-                timeout=(BACKEND_CONNECT_TIMEOUT_SECONDS, BACKEND_READ_TIMEOUT_SECONDS),
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data.get("answer", "I could not process your request right now.")
-        except (
-            requests.exceptions.ReadTimeout,
-            requests.exceptions.ConnectTimeout,
-            requests.exceptions.ConnectionError,
-        ) as exc:
-            if attempt >= total_attempts:
-                raise
-            sleep_for = BACKEND_RETRY_DELAY_SECONDS * attempt
-            logging.warning(
-                "Backend transient failure type=%s attempt=%s/%s retry_in=%.2fs",
-                type(exc).__name__,
-                attempt,
-                total_attempts,
-                sleep_for,
-            )
-            await asyncio.sleep(sleep_for)
-
-
-def reset_backend_session(chat_id: str):
-    if not USE_BACKEND_API:
-        return
-    try:
-        requests.post(RESET_URL, params={"chat_id": chat_id}, headers=BACKEND_HEADERS, timeout=10)
-    except requests.exceptions.RequestException:
-        logging.exception("Failed to reset backend session")
 
 
 def get_start_text():
@@ -199,20 +128,23 @@ async def _safe_reply(message, text: str, reply_markup=None) -> bool:
     return False
 
 
-async def start(update: Update, context):
+def _require_token() -> str:
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured.")
+    return TOKEN
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id is not None:
-        reset_backend_session(str(chat_id))
-        _reset_local_session(chat_id)
+        await asyncio.to_thread(reset_chat_session, str(chat_id))
     if update.message:
         await _safe_reply(update.message, get_start_text(), reply_markup=_active_reply_markup(chat_id))
 
 
-async def _run_query(message, context, chat_id: int, q: str):
+async def _run_query(message, context: ContextTypes.DEFAULT_TYPE, chat_id: int, q: str):
     if not message:
         return
-
-    params = {"q": q, "chat_id": str(chat_id)}
 
     lock = _get_lock(chat_id)
     if lock.locked():
@@ -227,31 +159,10 @@ async def _run_query(message, context, chat_id: int, q: str):
         answer: str | None = None
 
         try:
-            if USE_BACKEND_API:
-                try:
-                    answer = await _fetch_backend_answer(params)
-                    _set_local_previous_user_text(chat_id, q)
-                except requests.exceptions.RequestException:
-                    logging.exception("Backend request failed")
-                    if not LOCAL_AI_FALLBACK:
-                        answer = "Backend is busy right now. Please try again in a few seconds."
-                except ValueError:
-                    logging.exception("Backend returned invalid JSON")
-                    if not LOCAL_AI_FALLBACK:
-                        answer = "Backend returned an invalid response. Please try again."
-
-            if answer is None:
-                try:
-                    previous_user_text = _get_local_previous_user_text(chat_id)
-                    _, answer = await asyncio.to_thread(
-                        ai_engine.classify_and_reply,
-                        q,
-                        previous_user_text,
-                    )
-                    _set_local_previous_user_text(chat_id, q)
-                except Exception:
-                    logging.exception("Local AI fallback failed")
-                    answer = "Server is taking too long right now. Please try again in a few seconds."
+            answer = await asyncio.to_thread(query_chat, q, str(chat_id))
+        except Exception:
+            logging.exception("Telegram query handling failed")
+            answer = "Server is taking too long right now. Please try again in a few seconds."
         finally:
             typing_task.cancel()
             try:
@@ -264,13 +175,13 @@ async def _run_query(message, context, chat_id: int, q: str):
     await _safe_reply(message, answer, reply_markup=_active_reply_markup(chat_id))
 
 
-async def handle(update: Update, context):
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_chat:
         return
     await _run_query(update.message, context, update.effective_chat.id, update.message.text)
 
 
-async def handle_shortcut_command(update: Update, context):
+async def handle_shortcut_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or not update.effective_chat:
         return
     command = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
@@ -284,7 +195,7 @@ async def handle_shortcut_command(update: Update, context):
     )
 
 
-async def on_error(update: object, context):
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, (TimedOut, NetworkError)):
         logging.warning("Telegram transient network error: %s", type(context.error).__name__)
         return
@@ -301,8 +212,11 @@ async def _post_init(application):
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
-def _build_application():
-    app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
+def build_application(*, use_updater: bool) -> Application:
+    builder = ApplicationBuilder().token(_require_token())
+    if not use_updater:
+        builder = builder.updater(None)
+    app = builder.post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("result", handle_shortcut_command))
     app.add_handler(CommandHandler("calendar", handle_shortcut_command))
@@ -315,8 +229,33 @@ def _build_application():
     return app
 
 
+async def start_webhook_application(
+    application: Application,
+    *,
+    webhook_url: str,
+    webhook_secret: str = "",
+    drop_pending_updates: bool = False,
+) -> None:
+    if not webhook_url:
+        raise RuntimeError("TELEGRAM_WEBHOOK_URL must be configured when webhook mode is enabled.")
+    await application.initialize()
+    await _post_init(application)
+    await application.start()
+    await application.bot.set_webhook(
+        url=webhook_url,
+        secret_token=webhook_secret or None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=drop_pending_updates,
+    )
+
+
+async def stop_webhook_application(application: Application) -> None:
+    await application.stop()
+    await application.shutdown()
+
+
 def main():
-    app = _build_application()
+    app = build_application(use_updater=True)
     app.run_polling()
 
 

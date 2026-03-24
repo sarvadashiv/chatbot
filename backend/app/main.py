@@ -1,15 +1,27 @@
-import json
-import logging #backend logs
+import logging
 import secrets
+from contextlib import asynccontextmanager
 
-import requests #catch req related exceptions
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from telegram import Update
 
-from app import ai_engine
-from app.cache import delete_cache, delete_cache_by_prefix, get_cache, set_cache
-from app.config import BACKEND_API_KEY, LIVE_SEARCH_BYPASS_CACHE, QUERY_CACHE_TTL_SECONDS
-from app.db.logger import init_db, log_query
+from app.chat_service import query_chat, reset_chat_session
+from app.config import (
+    BACKEND_API_KEY,
+    TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES,
+    TELEGRAM_WEBHOOK_ENABLED,
+    TELEGRAM_WEBHOOK_PATH,
+    TELEGRAM_WEBHOOK_SECRET,
+    TELEGRAM_WEBHOOK_URL,
+)
+from app.db.logger import init_db
 from app.dashboard.routes import router as dashboard_router
+from bot.telegram_bot import (
+    TELEGRAM_SECRET_HEADER_NAME,
+    build_application,
+    start_webhook_application,
+    stop_webhook_application,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,73 +40,68 @@ def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-K
         )
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.telegram_app = None
+    if TELEGRAM_WEBHOOK_ENABLED:
+        telegram_app = build_application(use_updater=False)
+        await start_webhook_application(
+            telegram_app,
+            webhook_url=TELEGRAM_WEBHOOK_URL,
+            webhook_secret=TELEGRAM_WEBHOOK_SECRET,
+            drop_pending_updates=TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES,
+        )
+        app.state.telegram_app = telegram_app
+        logger.info("Telegram webhook initialized at path=%s", TELEGRAM_WEBHOOK_PATH)
+    yield
+    telegram_app = getattr(app.state, "telegram_app", None)
+    if telegram_app is not None:
+        await stop_webhook_application(telegram_app)
+
+
+app = FastAPI(lifespan=lifespan)
 init_db()
 app.include_router(dashboard_router)
 
 
 @app.post("/reset_session", dependencies=[Depends(_require_api_key)])
 def reset_session(chat_id: str):
-    delete_cache(f"ctx:{chat_id}")
-    delete_cache_by_prefix(f"q:{chat_id}:")
-    return {"ok": True, "message": "Session reset"}
+    return reset_chat_session(chat_id)
 
 
 @app.get("/query", dependencies=[Depends(_require_api_key)])
 def query(q: str, chat_id: str | None = None):
-    cache_key = f"q:{chat_id}:{q}" if chat_id else f"q:{q}"
-    use_cache = not LIVE_SEARCH_BYPASS_CACHE
-    cached = get_cache(cache_key) if use_cache else None
+    return {"answer": query_chat(q, chat_id)}
 
-    if cached:
-        return {"answer": cached}
 
-    previous_user_text = ""
-    if chat_id:
-        raw_ctx = get_cache(f"ctx:{chat_id}")
-        if raw_ctx:
-            try:
-                previous_user_text = json.loads(raw_ctx).get("last_user_query", "")
-            except Exception:
-                previous_user_text = ""
+@app.post(TELEGRAM_WEBHOOK_PATH, include_in_schema=False)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(
+        default=None,
+        alias=TELEGRAM_SECRET_HEADER_NAME,
+    ),
+):
+    telegram_app = getattr(request.app.state, "telegram_app", None)
+    if telegram_app is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Telegram webhook is not enabled.",
+        )
+    if TELEGRAM_WEBHOOK_SECRET and not x_telegram_bot_api_secret_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Telegram webhook secret.",
+        )
+    if TELEGRAM_WEBHOOK_SECRET and not secrets.compare_digest(
+        x_telegram_bot_api_secret_token or "",
+        TELEGRAM_WEBHOOK_SECRET,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Telegram webhook secret.",
+        )
 
-    try:
-        mode, reply = ai_engine.classify_and_reply(q, previous_user_text=previous_user_text)
-        status = "AI_ONE_CALL"
-    except requests.exceptions.HTTPError as exc:
-        response = exc.response
-        status_code = response.status_code if response is not None else None
-        logger.error("classify_and_reply failed type=%s status=%s", type(exc).__name__, status_code)
-        mode = "official_info"
-        if status_code == 429:
-            reply = "AI quota is currently exhausted. Please try again shortly."
-            status = "LLM_QUOTA_EXCEEDED"
-        else:
-            reply = "AI service is unavailable right now. Please try again."
-            status = "LLM_HTTP_ERROR"
-    except requests.exceptions.RequestException as exc:
-        logger.error("classify_and_reply failed type=%s", type(exc).__name__)
-        mode = "official_info"
-        reply = "AI service is taking too long right now. Please try again."
-        status = "LLM_TIMEOUT"
-    except RuntimeError as exc:
-        logger.error("classify_and_reply failed type=%s", type(exc).__name__)
-        mode = "official_info"
-        if "currently unavailable" in str(exc).lower():
-            reply = "All configured AI models are temporarily unavailable. Please try again later."
-            status = "LLM_MODELS_UNAVAILABLE"
-        else:
-            reply = "AI service is taking too long right now. Please try again."
-            status = "LLM_TIMEOUT"
-
-    log_query(
-        query=q,
-        intent=mode,
-        status=status,
-    )
-
-    if chat_id:
-        set_cache(f"ctx:{chat_id}", json.dumps({"last_user_query": q}), 86400)
-    if use_cache and QUERY_CACHE_TTL_SECONDS > 0:
-        set_cache(cache_key, reply, QUERY_CACHE_TTL_SECONDS)
-    return {"answer": reply}
+    payload = await request.json()
+    await telegram_app.update_queue.put(Update.de_json(payload, telegram_app.bot))
+    return {"ok": True}

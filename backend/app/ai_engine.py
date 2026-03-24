@@ -129,16 +129,15 @@ def _extract_object_like_field(text: str, field: str) -> str | None:
 
 def _build_system_prompt(today: str) -> str:
     return (
-        "You are an assistant only for AKTU and AKGEC queries. Politely reply to general convo, divert user towards asking AKTU/AKGEC related queries. "
-        f"Today's date (UTC) is {today}. "
-        "Use the live Google Search grounding tool to research factual claims, and ground ONLY from official "
-        f"AKTU/AKGEC domains (including subdomains): {ALLOWED_GROUNDING_DOMAINS_DISPLAY}. "
-        "Provide direct endpoint URLs for users. Do not provide navigation steps."
-        "Do not guess; if you cannot verify a claim, say that clearly."
-        "Return ONLY valid JSON with exactly two keys: mode and answer. "
-        "No markdown, no code fences, no extra keys.\n"
-        "Output contract:\n"
-        '- JSON shape must be {"mode":"smalltalk|official_info","answer":"..."}.\n'
+        "You are an assistant ONLY for AKTU and AKGEC queries. For general conversations, politely redirect users to ask AKTU/AKGEC questions. "
+        f"Today's date (UTC) is {today}. \n"
+        "CRITICAL INSTRUCTION: For ANY query about AKTU or AKGEC (links, portals, results, admissions, courses, etc.), YOU MUST use the Google Search tool to find current information. "
+        "Do NOT answer from memory. MANDATORY: Always search for factual information. "
+        f"Ground ONLY from official AKTU/AKGEC domains: {ALLOWED_GROUNDING_DOMAINS_DISPLAY}. "
+        "If no results are found from these official domains, explicitly state that the information is not available from official sources. \n"
+        "Provide direct endpoint URLs (e.g., https://oneview.aktu.ac.in/). Do not provide navigation steps. \n"
+        "Return ONLY valid JSON with two keys: mode (smalltalk|official_info) and answer (string). No markdown, no code blocks, no extra keys.\n"
+        'Output: {"mode":"smalltalk|official_info","answer":"..."}'
     )
 
 
@@ -156,9 +155,18 @@ def _tool_attempts() -> list[tuple[str, dict[str, Any] | None]]:
     if not GEMINI_ENABLE_GOOGLE_SEARCH:
         return [("none", None)]
 
+    # Use v1beta grounding configuration with dynamic retrieval
     return [
-        ("google_search", {"google_search": {}}),
-        ("googleSearch", {"googleSearch": {}}),
+        ("grounding_with_web", {
+            "googleSearchRetrieval": {
+                "dynamicRetrievalConfig": {
+                    "mode": "MODE_DYNAMIC",
+                    "dynamicThreshold": 0.3  # Lower threshold = more likely to search
+                }
+            }
+        }),
+        ("google_search_legacy", {"google_search": {}}),
+        ("googleSearch_legacy", {"googleSearch": {}}),
     ]
 
 
@@ -314,7 +322,13 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
         raise RuntimeError("GEMINI_API_KEY is missing.")
 
     prompt = _messages_to_prompt(messages)
+    today = datetime.utcnow().strftime("%B %d, %Y")
+    system_instruction = _build_system_prompt(today)
+    
     base_payload = {
+        "systemInstruction": {
+            "parts": [{"text": system_instruction}]
+        },
         "contents": [
             {"parts": [{"text": prompt}]}
         ],
@@ -351,7 +365,7 @@ def _chat(messages, timeout: int = 40) -> dict[str, Any]:
                 data = response.json()
                 text, sources = _extract_answer_text(data)
                 if GEMINI_REQUIRE_SEARCH_GROUNDING and GEMINI_ENABLE_GOOGLE_SEARCH and not sources:
-                    logger.warning("Gemini returned answer without grounding metadata.")
+                    logger.warning("Gemini returned answer without grounding metadata. model=%s tool=%s", model_name, tool_name)
                 return {
                     "text": text,
                     "sources": sources,
@@ -487,13 +501,8 @@ def classify_and_reply(user_text: str, previous_user_text: str = "") -> tuple[st
             f"Current user message: {user_text}"
         )
 
-    today = datetime.utcnow().strftime("%B %d, %Y")
     result = _chat(
         [
-            {
-                "role": "system",
-                "content": _build_system_prompt(today),
-            },
             {"role": "user", "content": user_content},
         ],
         timeout=45,

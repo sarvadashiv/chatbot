@@ -16,6 +16,13 @@ def _env_csv(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _env_path(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip() or default
+    if not value.startswith("/"):
+        return f"/{value}"
+    return value
+
+
 # Free-tier text generation Gemini models (kept configurable via GEMINI_FALLBACK_MODELS).
 DEFAULT_FREE_TIER_GEMINI_MODELS = [
     "gemini-2.5-pro",
@@ -33,6 +40,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
 DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+TELEGRAM_WEBHOOK_ENABLED = _env_bool("TELEGRAM_WEBHOOK_ENABLED", False)
+TELEGRAM_WEBHOOK_PATH = _env_path("TELEGRAM_WEBHOOK_PATH", "/telegram/webhook")
+TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES = _env_bool("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES", False)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_FALLBACK_MODELS = _env_csv(
     "GEMINI_FALLBACK_MODELS",
